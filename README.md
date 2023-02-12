@@ -1,2 +1,2 @@
 # ooler_ble_client
-Python package to communicate with an Ooler Sleep System using bluetooth.
+A library to communicate with Ooler Sleep System Bluetooth devices.
