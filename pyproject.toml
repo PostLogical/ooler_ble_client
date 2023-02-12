@@ -6,6 +6,7 @@ authors = ["Robby Griffin <rgriffin@postlogical.com>"]
 license = "Apache-2.0"
 readme = "README.md"
 packages = [{include = "ooler_ble_client"}]
+repository = "https://github.com/PostLogical/ooler_ble_client"
 
 [tool.poetry.dependencies]
 python = "^3.9"
