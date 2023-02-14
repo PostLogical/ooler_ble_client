@@ -156,10 +156,14 @@ class OolerBLEDevice:
 
     async def get_state(self, client: BleakClientWithServiceCache) -> None:
         """Retrieve state from device."""
-        power_int = int.from_bytes(client.read_gatt_char(power_characteristic), "little")
-        mode_int = int.from_bytes(client.read_gatt_char(mode_characteristic), "little")
-        settemp_int = int.from_bytes(client.read_gatt_char(settemp_characteristic), "little")
-        actualtemp_int = int.from_bytes(client.read_gatt_char(actualtemp_characteristic), "little")
+        power_byte = await client.read_gatt_char(power_characteristic)
+        mode_byte = await client.read_gatt_char(mode_characteristic)
+        settemp_byte = await client.read_gatt_char(settemp_characteristic)
+        actualtemp_byte = await client.read_gatt_char(actualtemp_characteristic)
+        power_int = int.from_bytes(power_byte, "little")
+        mode_int = int.from_bytes(mode_byte, "little")
+        settemp_int = int.from_bytes(settemp_byte, "little")
+        actualtemp_int = int.from_bytes(actualtemp_byte, "little")
 
         self._set_state_and_fire_callbacks(OolerBLEState(power_int, mode_int, settemp_int, actualtemp_int))
         _LOGGER.debug("%s: State retrieved.", self._model_id)
