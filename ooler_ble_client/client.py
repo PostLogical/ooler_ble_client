@@ -215,7 +215,7 @@ class OolerBLEDevice:
 
     async def _execute_disconnect(self) -> None:
         """Execute disconnection."""
-        async with client._connect_lock:
+        async with self._connect_lock:
             client = self._client
             actualtemp_char = self._actualtemp_char
             self._expected_disconnect = True
