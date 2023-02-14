@@ -124,7 +124,8 @@ class OolerBLEDevice:
             
             self._client = client
             self._reset_disconnect_timer()
-
+            _LOGGER.debug("%s: Attempt to retrieve intial state.", self._model_id)
+            await self.get_state(client)
             _LOGGER.debug(
                 "%s: Subscribe to notifications", self._model_id
             )
@@ -132,10 +133,6 @@ class OolerBLEDevice:
             await client.start_notify(self._mode_char, self._notification_handler)
             await client.start_notify(self._settemp_char, self._notification_handler)
             await client.start_notify(self._actualtemp_char, self._notification_handler)
-
-            power_int = 1
-            power_byte = power_int.to_bytes(1, "little")
-            await client.write_gatt_char(self._power_char, power_byte)
 
     def _notification_handler(self, _sender: BleakGATTCharacteristic, data: bytearray) -> None:
         """Handle notification responses."""
@@ -156,6 +153,16 @@ class OolerBLEDevice:
             actualtemp_int = int.from_bytes(data, "little")
 
         self._set_state_and_fire_callbacks(OolerBLEState(power_int, mode_int, settemp_int, actualtemp_int))
+
+    async def get_state(self, client: BleakClientWithServiceCache) -> None:
+        """Retrieve state from device."""
+        power_int = int.from_bytes(client.read_gatt_char(power_characteristic), "little")
+        mode_int = int.from_bytes(client.read_gatt_char(mode_characteristic), "little")
+        settemp_int = int.from_bytes(client.read_gatt_char(settemp_characteristic), "little")
+        actualtemp_int = int.from_bytes(client.read_gatt_char(actualtemp_characteristic), "little")
+
+        self._set_state_and_fire_callbacks(OolerBLEState(power_int, mode_int, settemp_int, actualtemp_int))
+        _LOGGER.debug("%s: State retrieved.", self._model_id)
 
     async def set_power(self, power_int: int) -> None:
         client = self._client
