@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "ooler-ble-client"
-version = "0.1.3"
+version = "0.1.4"
 description = "A library to communicate with Ooler Sleep System Bluetooth devices."
 authors = ["Robby Griffin <rgriffin@postlogical.com>"]
 license = "Apache-2.0"

@@ -136,20 +136,21 @@ class OolerBLEDevice:
 
     def _notification_handler(self, _sender: BleakGATTCharacteristic, data: bytearray) -> None:
         """Handle notification responses."""
-        _LOGGER.debug("%s: Notification received: %s", self._model_id, data.hex())
+        uuid = _sender.uuid
+        _LOGGER.debug("%s: Notification received: %s from %s", self._model_id, data.hex(), uuid)
 
         power_int = self._state.power
         mode_int = self._state.mode
         settemp_int = self._state.set_temperature
         actualtemp_int = self._state.actual_temperature
 
-        if _sender == power_characteristic:
+        if uuid == self._power_char:
             power_int = int.from_bytes(data, "little")
-        elif _sender == mode_characteristic:
+        elif uuid == self._mode_char:
             mode_int = int.from_bytes(data, "little")
-        elif _sender == settemp_characteristic:
+        elif uuid == self._settemp_char:
             settemp_int = int.from_bytes(data, "little")
-        elif _sender == actualtemp_characteristic:
+        elif uuid == self._actualtemp_char:
             actualtemp_int = int.from_bytes(data, "little")
 
         self._set_state_and_fire_callbacks(OolerBLEState(power_int, mode_int, settemp_int, actualtemp_int))
@@ -181,7 +182,7 @@ class OolerBLEDevice:
     async def set_temperature(self, settemp_int: int) -> None:
         client = self._client
         settemp_byte = settemp_int.to_bytes(1, "little")
-        await client.write_gatt_char(self._settemp_char, settemp_byte)
+        await client.write_gatt_char(self._settemp_char, settemp_byte, True)
 
     def _reset_disconnect_timer(self) -> None:
         """Reset disconnect timer."""
