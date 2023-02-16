@@ -56,6 +56,8 @@ class OolerBLEDevice:
         if self._client is None:
             return False
         elif self._client.is_connected:
+            if not self._state.connected:
+                self._set_state_and_fire_callbacks(OolerBLEState(self._state.power, self._state.mode, self._state.set_temperature, self._state.actual_temperature, True))
             return True
         else:
             return False
