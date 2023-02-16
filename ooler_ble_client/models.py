@@ -4,7 +4,8 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class OolerBLEState:
-    power: int = None
-    mode: int = None
-    set_temperature: int = None
-    actual_temperature: int = None
+    power: bool | None = None
+    mode: str | None = None
+    set_temperature: int | None = None
+    actual_temperature: int | None = None
+    connected: bool = False
