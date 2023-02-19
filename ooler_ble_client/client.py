@@ -62,7 +62,7 @@ class OolerBLEDevice:
 
     async def stop(self) -> None:
         """Stop the client."""
-        _LOGGER.debug("%s: Stop", self._model_id)
+        _LOGGER.error("%s: Stop", self._model_id)
         await self._execute_disconnect()
 
     def _set_state_and_fire_callbacks(self, state: OolerBLEState) -> None:
@@ -199,13 +199,14 @@ class OolerBLEDevice:
         """Reset disconnect timer."""
         if self._disconnect_timer:
             self._disconnect_timer.cancel()
-        self._disconnect_timer = self._loop.call_later(
-            DISCONNECT_DELAY, self._disconnect
-        )
+        if DISCONNECT_DELAY > 0:
+            self._disconnect_timer = self._loop.call_later(
+                DISCONNECT_DELAY, self._disconnect
+            )
     
     def _disconnected_callback(self, client: BleakClient) -> None:
         """Disconnected callback."""
-        _LOGGER.debug(
+        _LOGGER.error(
             "%s: Disconnected from device", self._model_id
         )
         self._state.connected = False
@@ -218,7 +219,7 @@ class OolerBLEDevice:
 
     async def _execute_timed_disconnect(self) -> None:
         """Execute timed disconnection."""
-        _LOGGER.debug(
+        _LOGGER.error(
             "%s: Disconnecting after timeout of %s",
             self._model_id,
             DISCONNECT_DELAY,
