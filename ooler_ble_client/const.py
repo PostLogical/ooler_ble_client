@@ -1,4 +1,8 @@
 """Constants for the ooler_ble_client library."""
+import logging
+
+_LOGGER = logging.getLogger(__package__)
+
 DEFAULT_ATTEMPTS = 3
 DISCONNECT_DELAY = 120
 

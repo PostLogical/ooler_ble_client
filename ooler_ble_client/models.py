@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-@dataclass(frozen=True)
+@dataclass
 class OolerBLEState:
     power: bool | None = None
     mode: str | None = None
