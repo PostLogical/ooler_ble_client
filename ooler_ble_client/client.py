@@ -42,7 +42,7 @@ class OolerBLEDevice:
             return False
         elif self._client.is_connected:
             if not self._state.connected:
-                self._set_state_and_fire_callbacks(OolerBLEState(self._state.power, self._state.mode, self._state.set_temperature, self._state.actual_temperature, True))
+                self._state.connected = True
             return True
         else:
             return False
@@ -178,7 +178,7 @@ class OolerBLEDevice:
         waterlevel_int = int.from_bytes(waterlevel_byte, "little")
         pumpwatts_int = int.from_bytes(pumpwatts_byte, "little")
         pumpvolts_int = int.from_bytes(pumpvolts_byte, "little")
-        clean = int.from_bytes(clean_byte, "little")
+        clean = bool(int.from_bytes(clean_byte, "little"))
 
         self._set_state_and_fire_callbacks(OolerBLEState(power, mode, settemp_int, actualtemp_int, waterlevel_int, pumpwatts_int, pumpvolts_int, clean, True))
         _LOGGER.debug("%s: State retrieved.", self._model_id)
