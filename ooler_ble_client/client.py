@@ -62,7 +62,7 @@ class OolerBLEDevice:
 
     async def stop(self) -> None:
         """Stop the client."""
-        _LOGGER.error("%s: Stop", self._model_id)
+        _LOGGER.debug("%s: Stop", self._model_id)
         await self._execute_disconnect()
 
     def _set_state_and_fire_callbacks(self, state: OolerBLEState) -> None:
@@ -115,28 +115,44 @@ class OolerBLEDevice:
             _LOGGER.debug(
                 "%s: Subscribe to notifications", self._model_id
             )
-            await client.start_notify(POWER_CHARACTERISTIC, self._notification_handler)
-            await client.start_notify(MODE_CHARACTERISTIC, self._notification_handler)
-            await client.start_notify(SETTEMP_CHARACTERISTIC, self._notification_handler)
-            await client.start_notify(ACTUALTEMP_CHARACTERISTIC, self._notification_handler)
+            await client.start_notify(POWER_CHAR, self._notification_handler)
+            await client.start_notify(MODE_CHAR, self._notification_handler)
+            await client.start_notify(SETTEMP_CHAR, self._notification_handler)
+            await client.start_notify(ACTUALTEMP_CHAR, self._notification_handler)
+            await client.start_notify(WATER_LEVEL_CHAR, self._notification_handler)
+            await client.start_notify(PUMP_WATTS_CHAR, self._notification_handler)
+            await client.start_notify(PUMP_VOLTS_CHAR, self._notification_handler)
+            await client.start_notify(CLEAN_CHAR, self._notification_handler)
 
     def _notification_handler(self, _sender: BleakGATTCharacteristic, data: bytearray) -> None:
         """Handle notification responses."""
         uuid = _sender.uuid
         _LOGGER.debug("%s: Notification received: %s from %s", self._model_id, data.hex(), uuid)
-        if uuid == POWER_CHARACTERISTIC:
+        if uuid == POWER_CHAR:
             power = bool(int.from_bytes(data, "little"))
             self._state.power = power
-        elif uuid == MODE_CHARACTERISTIC:
+        elif uuid == MODE_CHAR:
             mode_int = int.from_bytes(data, "little")
             mode = MODE_INT_TO_MODE_STATE[mode_int]
             self._state.mode = mode
-        elif uuid == SETTEMP_CHARACTERISTIC:
+        elif uuid == SETTEMP_CHAR:
             settemp_int = int.from_bytes(data, "little")
             self._state.set_temperature = settemp_int
-        elif uuid == ACTUALTEMP_CHARACTERISTIC:
+        elif uuid == ACTUALTEMP_CHAR:
             actualtemp_int = int.from_bytes(data, "little")
             self._state.actual_temperature = actualtemp_int
+        elif uuid == WATER_LEVEL_CHAR:
+            waterlevel_int = int.from_bytes(data, "little")
+            self._state.water_level = waterlevel_int
+        elif uuid == PUMP_WATTS_CHAR:
+            pumpwatts_int = int.from_bytes(data, "little")
+            self._state.pump_watts = pumpwatts_int
+        elif uuid == PUMP_VOLTS_CHAR:
+            pumpvolts_int = int.from_bytes(data, "little")
+            self._state.pump_volts = pumpvolts_int
+        elif uuid == CLEAN_CHAR:
+            clean = bool(int.from_bytes(data, "little"))
+            self._state.clean = clean
         self._fire_callbacks()
 
     async def async_poll(self) -> None:
@@ -145,28 +161,37 @@ class OolerBLEDevice:
         if client is None:
             return await self.connect()
 
-        power_byte = await client.read_gatt_char(POWER_CHARACTERISTIC)
-        mode_byte = await client.read_gatt_char(MODE_CHARACTERISTIC)
-        settemp_byte = await client.read_gatt_char(SETTEMP_CHARACTERISTIC)
-        actualtemp_byte = await client.read_gatt_char(ACTUALTEMP_CHARACTERISTIC)
+        power_byte = await client.read_gatt_char(POWER_CHAR)
+        mode_byte = await client.read_gatt_char(MODE_CHAR)
+        settemp_byte = await client.read_gatt_char(SETTEMP_CHAR)
+        actualtemp_byte = await client.read_gatt_char(ACTUALTEMP_CHAR)
+        waterlevel_byte = await client.read_gatt_char(WATER_LEVEL_CHAR)
+        pumpwatts_byte = await client.read_gatt_char(PUMP_WATTS_CHAR)
+        pumpvolts_byte = await client.read_gatt_char(PUMP_VOLTS_CHAR)
+        clean_byte = await client.read_gatt_char(CLEAN_CHAR)
+
         power = bool(int.from_bytes(power_byte, "little"))
         mode_int = int.from_bytes(mode_byte, "little")
         mode = MODE_INT_TO_MODE_STATE[mode_int]
         settemp_int = int.from_bytes(settemp_byte, "little")
         actualtemp_int = int.from_bytes(actualtemp_byte, "little")
+        waterlevel_int = int.from_bytes(waterlevel_byte, "little")
+        pumpwatts_int = int.from_bytes(pumpwatts_byte, "little")
+        pumpvolts_int = int.from_bytes(pumpvolts_byte, "little")
+        clean = int.from_bytes(clean_byte, "little")
 
-        self._set_state_and_fire_callbacks(OolerBLEState(power, mode, settemp_int, actualtemp_int, True))
+        self._set_state_and_fire_callbacks(OolerBLEState(power, mode, settemp_int, actualtemp_int, waterlevel_int, pumpwatts_int, pumpvolts_int, clean, True))
         _LOGGER.debug("%s: State retrieved.", self._model_id)
 
     async def set_power(self, power: bool) -> None:
         client = self._client
         if client is not None:
             power_byte = int(power).to_bytes(1, "little")
-            await client.write_gatt_char(POWER_CHARACTERISTIC, power_byte)
+            await client.write_gatt_char(POWER_CHAR, power_byte)
             _LOGGER.debug("Set power to %s.", power)
             self._state.power = power
         else:
-            _LOGGER.error("Tried to set power, but BleakClient is None.")
+            _LOGGER.debug("Tried to set power, but BleakClient is None.")
             await self.connect()
             await self.set_power(power)
     
@@ -175,11 +200,11 @@ class OolerBLEDevice:
         if client is not None:
             mode_int = MODE_INT_TO_MODE_STATE.index(mode)
             mode_byte = mode_int.to_bytes(1, "little")
-            await client.write_gatt_char(MODE_CHARACTERISTIC, mode_byte)
+            await client.write_gatt_char(MODE_CHAR, mode_byte)
             _LOGGER.debug("Set mode to %s.", mode)
             self._state.mode = mode
         else:
-            _LOGGER.error("Tried to set mode, but BleakClient is None.")
+            _LOGGER.debug("Tried to set mode, but BleakClient is None.")
             await self.connect()
             await self.set_mode(mode)
 
@@ -187,13 +212,26 @@ class OolerBLEDevice:
         client = self._client
         if client is not None:
             settemp_byte = settemp_int.to_bytes(1, "little")
-            await client.write_gatt_char(SETTEMP_CHARACTERISTIC, settemp_byte, True)
+            await client.write_gatt_char(SETTEMP_CHAR, settemp_byte, True)
             _LOGGER.debug("Set temperature to %s.", settemp_int)
             self._state.set_temperature = settemp_int
         else:
-            _LOGGER.error("Tried to set temperature, but BleakClient is None.")
+            _LOGGER.debug("Tried to set temperature, but BleakClient is None.")
             await self.connect()
             await self.set_temperature(settemp_int)
+
+    async def set_clean(self, clean: bool) -> None:
+        client = self._client
+        if client is not None:
+            clean_byte = int(clean).to_bytes(1, "little") #Check if clean uses same 0 and 1 as power in chracteristic
+            await client.write_gatt_char(CLEAN_CHAR, clean_byte)
+            _LOGGER.debug("Set clean to %s.", clean)
+            self._state.clean = clean
+        else:
+            _LOGGER.debug("Tried to set clean, but BleakClient is None.")
+            await self.connect()
+            await self.set_clean(clean)
+
 
     def _reset_disconnect_timer(self) -> None:
         """Reset disconnect timer."""
@@ -206,7 +244,7 @@ class OolerBLEDevice:
     
     def _disconnected_callback(self, client: BleakClient) -> None:
         """Disconnected callback."""
-        _LOGGER.error(
+        _LOGGER.debug(
             "%s: Disconnected from device", self._model_id
         )
         self._state.connected = False
@@ -219,7 +257,7 @@ class OolerBLEDevice:
 
     async def _execute_timed_disconnect(self) -> None:
         """Execute timed disconnection."""
-        _LOGGER.error(
+        _LOGGER.debug(
             "%s: Disconnecting after timeout of %s",
             self._model_id,
             DISCONNECT_DELAY,
@@ -233,8 +271,12 @@ class OolerBLEDevice:
             self._expected_disconnect = True
             self._client = None
             if client and client.is_connected:
-                await client.stop_notify(POWER_CHARACTERISTIC)
-                await client.stop_notify(MODE_CHARACTERISTIC)
-                await client.stop_notify(SETTEMP_CHARACTERISTIC)
-                await client.stop_notify(ACTUALTEMP_CHARACTERISTIC)
+                await client.stop_notify(POWER_CHAR)
+                await client.stop_notify(MODE_CHAR)
+                await client.stop_notify(SETTEMP_CHAR)
+                await client.stop_notify(ACTUALTEMP_CHAR)
+                await client.stop_notify(WATER_LEVEL_CHAR)
+                await client.stop_notify(PUMP_WATTS_CHAR)
+                await client.stop_notify(PUMP_VOLTS_CHAR)
+                await client.stop_notify(CLEAN_CHAR)
                 await client.disconnect()
