@@ -10,7 +10,5 @@ class OolerBLEState:
     actual_temperature: int | None = None
     water_level: int | None = None
     pump_watts: int | None = None
-    pump_volts: int | None  = None
     clean: bool | None = None
-    name: str | None = None
     connected: bool = False

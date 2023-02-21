@@ -57,11 +57,6 @@ class OolerBLEDevice:
         """Return the state."""
         return self._state
 
-    @property
-    def name(self) -> str | None:
-        """Get the name of the Ooler."""
-        return self._state.name
-
     async def connect(self) -> None:
         await self._ensure_connected()
 
@@ -126,7 +121,6 @@ class OolerBLEDevice:
             await client.start_notify(ACTUALTEMP_CHAR, self._notification_handler)
             await client.start_notify(WATER_LEVEL_CHAR, self._notification_handler)
             await client.start_notify(PUMP_WATTS_CHAR, self._notification_handler)
-            await client.start_notify(PUMP_VOLTS_CHAR, self._notification_handler)
             await client.start_notify(CLEAN_CHAR, self._notification_handler)
 
     def _notification_handler(self, _sender: BleakGATTCharacteristic, data: bytearray) -> None:
@@ -152,9 +146,6 @@ class OolerBLEDevice:
         elif uuid == PUMP_WATTS_CHAR:
             pumpwatts_int = int.from_bytes(data, "little")
             self._state.pump_watts = pumpwatts_int
-        elif uuid == PUMP_VOLTS_CHAR:
-            pumpvolts_int = int.from_bytes(data, "little")
-            self._state.pump_volts = pumpvolts_int
         elif uuid == CLEAN_CHAR:
             clean = bool(int.from_bytes(data, "little"))
             self._state.clean = clean
@@ -172,9 +163,7 @@ class OolerBLEDevice:
         actualtemp_byte = await client.read_gatt_char(ACTUALTEMP_CHAR)
         waterlevel_byte = await client.read_gatt_char(WATER_LEVEL_CHAR)
         pumpwatts_byte = await client.read_gatt_char(PUMP_WATTS_CHAR)
-        pumpvolts_byte = await client.read_gatt_char(PUMP_VOLTS_CHAR)
         clean_byte = await client.read_gatt_char(CLEAN_CHAR)
-        name_byte = await client.read_gatt_char(NAME_CHAR)
 
         power = bool(int.from_bytes(power_byte, "little"))
         mode_int = int.from_bytes(mode_byte, "little")
@@ -183,11 +172,9 @@ class OolerBLEDevice:
         actualtemp_int = int.from_bytes(actualtemp_byte, "little")
         waterlevel_int = int.from_bytes(waterlevel_byte, "little")
         pumpwatts_int = int.from_bytes(pumpwatts_byte, "little")
-        pumpvolts_int = int.from_bytes(pumpvolts_byte, "little")
         clean = bool(int.from_bytes(clean_byte, "little"))
-        name = name_byte.decode(encoding="ascii")
 
-        self._set_state_and_fire_callbacks(OolerBLEState(power, mode, settemp_int, actualtemp_int, waterlevel_int, pumpwatts_int, pumpvolts_int, clean, name, True))
+        self._set_state_and_fire_callbacks(OolerBLEState(power, mode, settemp_int, actualtemp_int, waterlevel_int, pumpwatts_int, clean, True))
         _LOGGER.debug("%s: State retrieved.", self._model_id)
 
     async def set_power(self, power: bool) -> None:
@@ -284,6 +271,5 @@ class OolerBLEDevice:
                 await client.stop_notify(ACTUALTEMP_CHAR)
                 await client.stop_notify(WATER_LEVEL_CHAR)
                 await client.stop_notify(PUMP_WATTS_CHAR)
-                await client.stop_notify(PUMP_VOLTS_CHAR)
                 await client.stop_notify(CLEAN_CHAR)
                 await client.disconnect()
