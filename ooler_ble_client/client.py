@@ -187,6 +187,7 @@ class OolerBLEDevice:
         else:
             _LOGGER.debug("Tried to set power, but BleakClient is None.")
             await self.connect()
+            # Probably should adjust this since it could create an infinite loop.
             await self.set_power(power)
     
     async def set_mode(self, mode: str) -> None:
@@ -199,6 +200,7 @@ class OolerBLEDevice:
             self._state.mode = mode
         else:
             _LOGGER.debug("Tried to set mode, but BleakClient is None.")
+            # Probably should adjust this since it could create an infinite loop.
             await self.connect()
             await self.set_mode(mode)
 
@@ -211,18 +213,20 @@ class OolerBLEDevice:
             self._state.set_temperature = settemp_int
         else:
             _LOGGER.debug("Tried to set temperature, but BleakClient is None.")
+            # Probably should adjust this since it could create an infinite loop.
             await self.connect()
             await self.set_temperature(settemp_int)
 
     async def set_clean(self, clean: bool) -> None:
         client = self._client
         if client is not None:
-            clean_byte = int(clean).to_bytes(1, "little") #Check if clean uses same 0 and 1 as power in chracteristic
+            clean_byte = int(clean).to_bytes(1, "little")
             await client.write_gatt_char(CLEAN_CHAR, clean_byte)
             _LOGGER.debug("Set clean to %s.", clean)
             self._state.clean = clean
         else:
             _LOGGER.debug("Tried to set clean, but BleakClient is None.")
+            # Probably should adjust this since it could create an infinite loop.
             await self.connect()
             await self.set_clean(clean)
 
