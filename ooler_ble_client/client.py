@@ -230,6 +230,22 @@ class OolerBLEDevice:
             await self.connect()
             await self.set_clean(clean)
 
+    async def check_connection_status(self, device: BLEDevice) -> bool:
+        self.set_ble_device(device)
+        await self.connect()
+        client = self._client
+        assert client
+        orig_power_byte = await client.read_gatt_char(POWER_CHAR)
+        orig_power = bool(int.from_bytes(orig_power_byte, "little"))
+        write_power_byte = int(not orig_power).to_bytes(1, "little")
+        await client.write_gatt_char(POWER_CHAR, write_power_byte)
+        await asyncio.sleep(2)
+        read_power_byte = await client.read_gatt_char(POWER_CHAR)
+        if write_power_byte == read_power_byte:
+            await client.write_gatt_char(POWER_CHAR, orig_power_byte)
+            return True
+        else:
+            return False
 
     def _reset_disconnect_timer(self) -> None:
         """Reset disconnect timer."""
