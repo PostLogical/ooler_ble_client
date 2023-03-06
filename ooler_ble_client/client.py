@@ -18,6 +18,7 @@ from .const import _LOGGER
 
 WrapFuncType = TypeVar("WrapFuncType", bound=Callable[..., Any])
 
+
 class OolerBLEDevice:
     _operation_lock = asyncio.Lock()
     _state: OolerBLEState = OolerBLEState()
@@ -46,7 +47,7 @@ class OolerBLEDevice:
             return True
         else:
             return False
-    
+
     @property
     def address(self) -> str:
         """Return the address."""
@@ -75,8 +76,11 @@ class OolerBLEDevice:
         for callback in self._callbacks:
             callback(self._state)
 
-    def register_callback(self, callback: Callable[[OolerBLEState], None]) -> Callable[[], None]:
+    def register_callback(
+        self, callback: Callable[[OolerBLEState], None]
+    ) -> Callable[[], None]:
         """Register a callback to be called when the state changes."""
+
         def unregister_callback() -> None:
             self._callbacks.remove(callback)
 
@@ -88,13 +92,13 @@ class OolerBLEDevice:
         if self._connect_lock.locked():
             _LOGGER.debug(
                 "%s: Connection already in progress, waiting for it to complete",
-                self._model_id
+                self._model_id,
             )
         if self.is_connected:
             self._reset_disconnect_timer()
             return
         async with self._connect_lock:
-            #Check again while holding the lock
+            # Check again while holding the lock
             if self.is_connected:
                 self._reset_disconnect_timer()
                 return
@@ -112,9 +116,7 @@ class OolerBLEDevice:
             self._reset_disconnect_timer()
             _LOGGER.debug("%s: Attempt to retrieve intial state.", self._model_id)
             await self.async_poll()
-            _LOGGER.debug(
-                "%s: Subscribe to notifications", self._model_id
-            )
+            _LOGGER.debug("%s: Subscribe to notifications", self._model_id)
             await client.start_notify(POWER_CHAR, self._notification_handler)
             await client.start_notify(MODE_CHAR, self._notification_handler)
             await client.start_notify(SETTEMP_CHAR, self._notification_handler)
@@ -123,10 +125,14 @@ class OolerBLEDevice:
             await client.start_notify(PUMP_WATTS_CHAR, self._notification_handler)
             await client.start_notify(CLEAN_CHAR, self._notification_handler)
 
-    def _notification_handler(self, _sender: BleakGATTCharacteristic, data: bytearray) -> None:
+    def _notification_handler(
+        self, _sender: BleakGATTCharacteristic, data: bytearray
+    ) -> None:
         """Handle notification responses."""
         uuid = _sender.uuid
-        _LOGGER.debug("%s: Notification received: %s from %s", self._model_id, data.hex(), uuid)
+        _LOGGER.debug(
+            "%s: Notification received: %s from %s", self._model_id, data.hex(), uuid
+        )
         if uuid == POWER_CHAR:
             power = bool(int.from_bytes(data, "little"))
             self._state.power = power
@@ -174,14 +180,25 @@ class OolerBLEDevice:
         pumpwatts_int = int.from_bytes(pumpwatts_byte, "little")
         clean = bool(int.from_bytes(clean_byte, "little"))
 
-        self._set_state_and_fire_callbacks(OolerBLEState(power, mode, settemp_int, actualtemp_int, waterlevel_int, pumpwatts_int, clean, True))
+        self._set_state_and_fire_callbacks(
+            OolerBLEState(
+                power,
+                mode,
+                settemp_int,
+                actualtemp_int,
+                waterlevel_int,
+                pumpwatts_int,
+                clean,
+                True,
+            )
+        )
         _LOGGER.debug("%s: State retrieved.", self._model_id)
 
     async def set_power(self, power: bool) -> None:
         client = self._client
         if client is not None:
             power_byte = int(power).to_bytes(1, "little")
-            await client.write_gatt_char(POWER_CHAR, power_byte)
+            await client.write_gatt_char(POWER_CHAR, power_byte, True)
             _LOGGER.debug("Set power to %s.", power)
             self._state.power = power
         else:
@@ -189,13 +206,13 @@ class OolerBLEDevice:
             await self.connect()
             # Probably should adjust this since it could create an infinite loop.
             await self.set_power(power)
-    
+
     async def set_mode(self, mode: str) -> None:
         client = self._client
         if client is not None:
             mode_int = MODE_INT_TO_MODE_STATE.index(mode)
             mode_byte = mode_int.to_bytes(1, "little")
-            await client.write_gatt_char(MODE_CHAR, mode_byte)
+            await client.write_gatt_char(MODE_CHAR, mode_byte, True)
             _LOGGER.debug("Set mode to %s.", mode)
             self._state.mode = mode
         else:
@@ -221,7 +238,7 @@ class OolerBLEDevice:
         client = self._client
         if client is not None:
             clean_byte = int(clean).to_bytes(1, "little")
-            await client.write_gatt_char(CLEAN_CHAR, clean_byte)
+            await client.write_gatt_char(CLEAN_CHAR, clean_byte, True)
             _LOGGER.debug("Set clean to %s.", clean)
             self._state.clean = clean
         else:
@@ -234,15 +251,16 @@ class OolerBLEDevice:
         self.set_ble_device(device)
         await self.connect()
         client = self._client
-        assert client
+        if client is None:
+            return False
         orig_power_byte = await client.read_gatt_char(POWER_CHAR)
         orig_power = bool(int.from_bytes(orig_power_byte, "little"))
         write_power_byte = int(not orig_power).to_bytes(1, "little")
-        await client.write_gatt_char(POWER_CHAR, write_power_byte)
+        await client.write_gatt_char(POWER_CHAR, write_power_byte, True)
         await asyncio.sleep(2)
         read_power_byte = await client.read_gatt_char(POWER_CHAR)
         if write_power_byte == read_power_byte:
-            await client.write_gatt_char(POWER_CHAR, orig_power_byte)
+            await client.write_gatt_char(POWER_CHAR, orig_power_byte, True)
             return True
         else:
             return False
@@ -255,12 +273,10 @@ class OolerBLEDevice:
             self._disconnect_timer = self._loop.call_later(
                 DISCONNECT_DELAY, self._disconnect
             )
-    
+
     def _disconnected_callback(self, client: BleakClient) -> None:
         """Disconnected callback."""
-        _LOGGER.debug(
-            "%s: Disconnected from device", self._model_id
-        )
+        _LOGGER.debug("%s: Disconnected from device", self._model_id)
         self._state.connected = False
         self._fire_callbacks()
 
