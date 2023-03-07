@@ -19,6 +19,26 @@ from .const import _LOGGER
 WrapFuncType = TypeVar("WrapFuncType", bound=Callable[..., Any])
 
 
+async def test_connection(device: BLEDevice) -> bool:
+    try:
+        async with BleakClient(device) as client:
+            if not client.is_connected:
+                return False
+            orig_power_byte = await client.read_gatt_char(POWER_CHAR)
+            orig_power = bool(int.from_bytes(orig_power_byte, "little"))
+            write_power_byte = int(not orig_power).to_bytes(1, "little")
+            await client.write_gatt_char(POWER_CHAR, write_power_byte, True)
+            await asyncio.sleep(1)
+            read_power_byte = await client.read_gatt_char(POWER_CHAR)
+            if write_power_byte == read_power_byte:
+                await client.write_gatt_char(POWER_CHAR, orig_power_byte, True)
+                return True
+            else:
+                return False
+    except Exception as err:
+        raise err
+
+
 class OolerBLEDevice:
     _operation_lock = asyncio.Lock()
     _state: OolerBLEState = OolerBLEState()
@@ -246,24 +266,6 @@ class OolerBLEDevice:
             # Probably should adjust this since it could create an infinite loop.
             await self.connect()
             await self.set_clean(clean)
-
-    async def check_connection_status(self, device: BLEDevice) -> bool:
-        self.set_ble_device(device)
-        await self.connect()
-        client = self._client
-        if client is None:
-            return False
-        orig_power_byte = await client.read_gatt_char(POWER_CHAR)
-        orig_power = bool(int.from_bytes(orig_power_byte, "little"))
-        write_power_byte = int(not orig_power).to_bytes(1, "little")
-        await client.write_gatt_char(POWER_CHAR, write_power_byte, True)
-        await asyncio.sleep(2)
-        read_power_byte = await client.read_gatt_char(POWER_CHAR)
-        if write_power_byte == read_power_byte:
-            await client.write_gatt_char(POWER_CHAR, orig_power_byte, True)
-            return True
-        else:
-            return False
 
     def _reset_disconnect_timer(self) -> None:
         """Reset disconnect timer."""
