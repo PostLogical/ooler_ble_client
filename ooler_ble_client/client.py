@@ -227,8 +227,9 @@ class OolerBLEDevice:
 
             # Re-send other values that may have been changed while ooler is not running,
             # they are not updated unless on.
-            await self.set_mode(self._state.mode)
-            await self.set_temperature(self._state.set_temperature)
+            if power == True:
+                await self.set_mode(self._state.mode)
+                await self.set_temperature(self._state.set_temperature)
         else:
             _LOGGER.debug("Tried to set power, but BleakClient is None.")
             await self.connect()
