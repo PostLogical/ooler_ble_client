@@ -156,6 +156,9 @@ class OolerBLEDevice:
         if uuid == POWER_CHAR:
             power = bool(int.from_bytes(data, "little"))
             self._state.power = power
+            # OFF ends clean. Similarly, when clean mode ends, the device only sends OFF.
+            if power == False:
+                self._state.clean = False
         elif uuid == MODE_CHAR:
             mode_int = int.from_bytes(data, "little")
             mode = MODE_INT_TO_MODE_STATE[mode_int]
@@ -221,6 +224,12 @@ class OolerBLEDevice:
             await client.write_gatt_char(POWER_CHAR, power_byte, True)
             _LOGGER.debug("Set power to %s.", power)
             self._state.power = power
+
+            # Re-send other values that may have been changed while ooler is not running,
+            # they are not updated unless on.
+            if power == True:
+                await self.set_mode(self._state.mode)
+                await self.set_temperature(self._state.set_temperature)
         else:
             _LOGGER.debug("Tried to set power, but BleakClient is None.")
             await self.connect()
@@ -257,6 +266,9 @@ class OolerBLEDevice:
     async def set_clean(self, clean: bool) -> None:
         client = self._client
         if client is not None:
+            # Turn on first else clean will not be active.
+            await self.set_power(True)
+
             clean_byte = int(clean).to_bytes(1, "little")
             await client.write_gatt_char(CLEAN_CHAR, clean_byte, True)
             _LOGGER.debug("Set clean to %s.", clean)
