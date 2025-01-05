@@ -141,6 +141,7 @@ class OolerBLEDevice:
             await client.start_notify(MODE_CHAR, self._notification_handler)
             await client.start_notify(SETTEMP_CHAR, self._notification_handler)
             await client.start_notify(ACTUALTEMP_CHAR, self._notification_handler)
+            await client.start_notify(PUMP_WATTS_CHAR, self._notification_handler)
             await client.start_notify(WATER_LEVEL_CHAR, self._notification_handler)
             # await client.start_notify(PUMP_WATTS_CHAR, self._notification_handler)
             # await client.start_notify(CLEAN_CHAR, self._notification_handler)
@@ -169,6 +170,9 @@ class OolerBLEDevice:
         elif uuid == ACTUALTEMP_CHAR:
             actualtemp_int = int.from_bytes(data, "little")
             self._state.actual_temperature = actualtemp_int
+        elif uuid == PUMP_WATTS_CHAR:
+            pumpwatts_int = int.from_bytes(data, "little")
+            self._state.pump_watts = pumpwatts_int
         elif uuid == WATER_LEVEL_CHAR:
             waterlevel_int = int.from_bytes(data, "little")
             self._state.water_level = waterlevel_int
@@ -190,6 +194,7 @@ class OolerBLEDevice:
         mode_byte = await client.read_gatt_char(MODE_CHAR)
         settemp_byte = await client.read_gatt_char(SETTEMP_CHAR)
         actualtemp_byte = await client.read_gatt_char(ACTUALTEMP_CHAR)
+        pumpwatts_byte = await client.read_gatt_char(PUMP_WATTS_CHAR)
         waterlevel_byte = await client.read_gatt_char(WATER_LEVEL_CHAR)
         # pumpwatts_byte = await client.read_gatt_char(PUMP_WATTS_CHAR)
         # clean_byte = await client.read_gatt_char(CLEAN_CHAR)
@@ -199,6 +204,7 @@ class OolerBLEDevice:
         mode = MODE_INT_TO_MODE_STATE[mode_int]
         settemp_int = int.from_bytes(settemp_byte, "little")
         actualtemp_int = int.from_bytes(actualtemp_byte, "little")
+        pumpwatts_int = int.from_bytes(pumpwatts_byte, "little")
         waterlevel_int = int.from_bytes(waterlevel_byte, "little")
         # pumpwatts_int = int.from_bytes(pumpwatts_byte, "little")
         # clean = bool(int.from_bytes(clean_byte, "little"))
@@ -209,6 +215,7 @@ class OolerBLEDevice:
                 mode,
                 settemp_int,
                 actualtemp_int,
+                pumpwatts_int,
                 waterlevel_int,
                 # pumpwatts_int,
                 # clean,
@@ -319,6 +326,7 @@ class OolerBLEDevice:
                 await client.stop_notify(MODE_CHAR)
                 await client.stop_notify(SETTEMP_CHAR)
                 await client.stop_notify(ACTUALTEMP_CHAR)
+                await client.stop_notify(PUMP_WATTS_CHAR)
                 await client.stop_notify(WATER_LEVEL_CHAR)
                 # await client.stop_notify(PUMP_WATTS_CHAR)
                 # await client.stop_notify(CLEAN_CHAR)

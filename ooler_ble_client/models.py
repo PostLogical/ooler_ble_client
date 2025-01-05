@@ -8,6 +8,7 @@ class OolerBLEState:
     mode: str | None = None
     set_temperature: int | None = None
     actual_temperature: int | None = None
+    pump_watts: int | None = None
     water_level: int | None = None
     # pump_watts: int | None = None
     # clean: bool | None = None
