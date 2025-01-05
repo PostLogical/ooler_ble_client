@@ -143,7 +143,7 @@ class OolerBLEDevice:
             await client.start_notify(ACTUALTEMP_CHAR, self._notification_handler)
             await client.start_notify(WATER_LEVEL_CHAR, self._notification_handler)
             # await client.start_notify(PUMP_WATTS_CHAR, self._notification_handler)
-            await client.start_notify(CLEAN_CHAR, self._notification_handler)
+            # await client.start_notify(CLEAN_CHAR, self._notification_handler)
 
     def _notification_handler(
         self, _sender: BleakGATTCharacteristic, data: bytearray
@@ -175,9 +175,9 @@ class OolerBLEDevice:
         # elif uuid == PUMP_WATTS_CHAR:
         #     pumpwatts_int = int.from_bytes(data, "little")
         #     self._state.pump_watts = pumpwatts_int
-        elif uuid == CLEAN_CHAR:
-            clean = bool(int.from_bytes(data, "little"))
-            self._state.clean = clean
+        # elif uuid == CLEAN_CHAR:
+        #     clean = bool(int.from_bytes(data, "little"))
+        #     self._state.clean = clean
         self._fire_callbacks()
 
     async def async_poll(self) -> None:
@@ -192,7 +192,7 @@ class OolerBLEDevice:
         actualtemp_byte = await client.read_gatt_char(ACTUALTEMP_CHAR)
         waterlevel_byte = await client.read_gatt_char(WATER_LEVEL_CHAR)
         # pumpwatts_byte = await client.read_gatt_char(PUMP_WATTS_CHAR)
-        clean_byte = await client.read_gatt_char(CLEAN_CHAR)
+        # clean_byte = await client.read_gatt_char(CLEAN_CHAR)
 
         power = bool(int.from_bytes(power_byte, "little"))
         mode_int = int.from_bytes(mode_byte, "little")
@@ -201,7 +201,7 @@ class OolerBLEDevice:
         actualtemp_int = int.from_bytes(actualtemp_byte, "little")
         waterlevel_int = int.from_bytes(waterlevel_byte, "little")
         # pumpwatts_int = int.from_bytes(pumpwatts_byte, "little")
-        clean = bool(int.from_bytes(clean_byte, "little"))
+        # clean = bool(int.from_bytes(clean_byte, "little"))
 
         self._set_state_and_fire_callbacks(
             OolerBLEState(
@@ -211,7 +211,7 @@ class OolerBLEDevice:
                 actualtemp_int,
                 waterlevel_int,
                 # pumpwatts_int,
-                clean,
+                # clean,
                 True,
             )
         )
@@ -263,21 +263,21 @@ class OolerBLEDevice:
             await self.connect()
             await self.set_temperature(settemp_int)
 
-    async def set_clean(self, clean: bool) -> None:
-        client = self._client
-        if client is not None:
-            # Turn on first else clean will not be active.
-            await self.set_power(True)
+    # async def set_clean(self, clean: bool) -> None:
+    #     client = self._client
+    #     if client is not None:
+    #         # Turn on first else clean will not be active.
+    #         await self.set_power(True)
 
-            clean_byte = int(clean).to_bytes(1, "little")
-            await client.write_gatt_char(CLEAN_CHAR, clean_byte, True)
-            _LOGGER.debug("Set clean to %s.", clean)
-            self._state.clean = clean
-        else:
-            _LOGGER.debug("Tried to set clean, but BleakClient is None.")
-            # Probably should adjust this since it could create an infinite loop.
-            await self.connect()
-            await self.set_clean(clean)
+    #         clean_byte = int(clean).to_bytes(1, "little")
+    #         await client.write_gatt_char(CLEAN_CHAR, clean_byte, True)
+    #         _LOGGER.debug("Set clean to %s.", clean)
+    #         self._state.clean = clean
+    #     else:
+    #         _LOGGER.debug("Tried to set clean, but BleakClient is None.")
+    #         # Probably should adjust this since it could create an infinite loop.
+    #         await self.connect()
+    #         await self.set_clean(clean)
 
     def _reset_disconnect_timer(self) -> None:
         """Reset disconnect timer."""
@@ -321,5 +321,5 @@ class OolerBLEDevice:
                 await client.stop_notify(ACTUALTEMP_CHAR)
                 await client.stop_notify(WATER_LEVEL_CHAR)
                 # await client.stop_notify(PUMP_WATTS_CHAR)
-                await client.stop_notify(CLEAN_CHAR)
+                # await client.stop_notify(CLEAN_CHAR)
                 await client.disconnect()
