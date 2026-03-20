@@ -144,3 +144,6 @@ cython_debug/
 
 #MacOS files
 .DS_Store
+
+# Dev Container Settings
+*.code-workspace
