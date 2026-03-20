@@ -1,17 +1,23 @@
-[tool.poetry]
+[project]
 name = "ooler-ble-client"
-version = "0.7.1"
+version = "0.8.1b1"
 description = "A library to communicate with Ooler Sleep System Bluetooth devices."
-authors = ["Robby Griffin <rgriffin@postlogical.com>"]
-license = "Apache-2.0"
 readme = "README.md"
-packages = [{include = "ooler_ble_client"}]
-repository = "https://github.com/PostLogical/ooler_ble_client"
+license = "Apache-2.0"
+authors = [
+    { name = "Robby Griffin", email = "rgriffin@postlogical.com" },
+]
+requires-python = ">=3.11,<4.0"
+dependencies = [
+    "bleak>=0.19.5",
+    "bleak-retry-connector>=2.3.0",
+]
 
-[tool.poetry.dependencies]
-python = "^3.9"
-bleak = ">=0.19.5"
-bleak-retry-connector = ">=2.3.0"
+[project.urls]
+Repository = "https://github.com/PostLogical/ooler_ble_client"
+
+[tool.poetry]
+packages = [{include = "ooler_ble_client"}]
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.0"

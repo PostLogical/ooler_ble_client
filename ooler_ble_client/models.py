@@ -11,4 +11,3 @@ class OolerBLEState:
     water_level: int | None = None
     pump_watts: int | None = None
     clean: bool | None = None
-    connected: bool = False

@@ -3,8 +3,6 @@ import logging
 
 _LOGGER = logging.getLogger(__package__)
 
-DEFAULT_ATTEMPTS = 3
-DISCONNECT_DELAY = 0
 
 MODE_INT_TO_MODE_STATE = ["Silent", "Regular", "Boost"]
 

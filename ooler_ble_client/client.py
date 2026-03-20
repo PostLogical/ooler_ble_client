@@ -13,64 +13,49 @@ from bleak import BleakClient
 from bleak_retry_connector import establish_connection
 
 from .models import OolerBLEState
-from .const import *
-from .const import _LOGGER
+from .const import (
+    _LOGGER,
+    MODE_INT_TO_MODE_STATE,
+    POWER_CHAR,
+    MODE_CHAR,
+    SETTEMP_CHAR,
+    ACTUALTEMP_CHAR,
+    WATER_LEVEL_CHAR,
+    PUMP_WATTS_CHAR,
+    CLEAN_CHAR,
+)
 
 WrapFuncType = TypeVar("WrapFuncType", bound=Callable[..., Any])
 
 
-async def test_connection(device: BLEDevice) -> bool:
-    try:
-        async with BleakClient(device) as client:
-            if not client.is_connected:
-                return False
-            orig_power_byte = await client.read_gatt_char(POWER_CHAR)
-            orig_power = bool(int.from_bytes(orig_power_byte, "little"))
-            write_power_byte = int(not orig_power).to_bytes(1, "little")
-            await client.write_gatt_char(POWER_CHAR, write_power_byte, True)
-            await asyncio.sleep(1)
-            read_power_byte = await client.read_gatt_char(POWER_CHAR)
-            if write_power_byte == read_power_byte:
-                await client.write_gatt_char(POWER_CHAR, orig_power_byte, True)
-                return True
-            else:
-                return False
-    except Exception as err:
-        raise err
 
 
 class OolerBLEDevice:
-    _operation_lock = asyncio.Lock()
-    _state: OolerBLEState = OolerBLEState()
-    _connect_lock: asyncio.Lock = asyncio.Lock()
-    _disconnect_timer: asyncio.TimerHandle | None = None
-    _client: BleakClient | None = None
-    _callbacks: list[Callable[[OolerBLEState], None]] = []
 
     def __init__(self, model: str) -> None:
         """Initialize the OolerBLEDevice."""
         self._model_id = model
-        self._loop = asyncio.get_running_loop()
+        self._state = OolerBLEState()
+        self._connect_lock = asyncio.Lock()
+        self._client: BleakClient | None = None
+        self._callbacks: list[Callable[[OolerBLEState], None]] = []
+        self._ble_device: BLEDevice | None = None
+        self._expected_disconnect = False
 
     def set_ble_device(self, ble_device: BLEDevice) -> None:
-        """Set the BLE Device and advertisement data."""
+        """Set the BLE Device."""
         self._ble_device = ble_device
 
     @property
     def is_connected(self) -> bool:
         """Return whether the device is connected."""
-        if self._client is None:
-            return False
-        elif self._client.is_connected:
-            if not self._state.connected:
-                self._state.connected = True
-            return True
-        else:
-            return False
+        return self._client is not None and self._client.is_connected
 
     @property
     def address(self) -> str:
         """Return the address."""
+        if self._ble_device is None:
+            raise RuntimeError("BLE device not set — call set_ble_device() first")
         return self._ble_device.address
 
     @property
@@ -115,13 +100,13 @@ class OolerBLEDevice:
                 self._model_id,
             )
         if self.is_connected:
-            self._reset_disconnect_timer()
             return
         async with self._connect_lock:
             # Check again while holding the lock
             if self.is_connected:
-                self._reset_disconnect_timer()
                 return
+            if self._ble_device is None:
+                raise RuntimeError("BLE device not set — call set_ble_device() first")
             _LOGGER.debug("%s: Connecting", self._model_id)
             client = await establish_connection(
                 BleakClient,
@@ -133,8 +118,7 @@ class OolerBLEDevice:
             )
             _LOGGER.debug("%s: Connected", self._model_id)
             self._client = client
-            self._reset_disconnect_timer()
-            _LOGGER.debug("%s: Attempt to retrieve intial state.", self._model_id)
+            _LOGGER.debug("%s: Attempt to retrieve initial state.", self._model_id)
             await self.async_poll()
             _LOGGER.debug("%s: Subscribe to notifications", self._model_id)
             await client.start_notify(POWER_CHAR, self._notification_handler)
@@ -157,7 +141,7 @@ class OolerBLEDevice:
             power = bool(int.from_bytes(data, "little"))
             self._state.power = power
             # OFF ends clean. Similarly, when clean mode ends, the device only sends OFF.
-            if power == False:
+            if not power:
                 self._state.clean = False
         elif uuid == MODE_CHAR:
             mode_int = int.from_bytes(data, "little")
@@ -205,108 +189,79 @@ class OolerBLEDevice:
 
         self._set_state_and_fire_callbacks(
             OolerBLEState(
-                power,
-                mode,
-                settemp_int,
-                actualtemp_int,
-                waterlevel_int,
-                pumpwatts_int,
-                clean,
-                True,
+                power=power,
+                mode=mode,
+                set_temperature=settemp_int,
+                actual_temperature=actualtemp_int,
+                water_level=waterlevel_int,
+                pump_watts=pumpwatts_int,
+                clean=clean,
             )
         )
         _LOGGER.debug("%s: State retrieved.", self._model_id)
 
     async def set_power(self, power: bool) -> None:
-        client = self._client
-        if client is not None:
-            power_byte = int(power).to_bytes(1, "little")
-            await client.write_gatt_char(POWER_CHAR, power_byte, True)
-            _LOGGER.debug("Set power to %s.", power)
-            self._state.power = power
-
-            # Re-send other values that may have been changed while ooler is not running,
-            # they are not updated unless on.
-            if power == True:
-                await self.set_mode(self._state.mode)
-                await self.set_temperature(self._state.set_temperature)
-        else:
-            _LOGGER.debug("Tried to set power, but BleakClient is None.")
+        if self._client is None:
             await self.connect()
-            # Probably should adjust this since it could create an infinite loop.
-            await self.set_power(power)
+        client = self._client
+        if client is None:
+            raise RuntimeError("Failed to connect to device")
+        power_byte = int(power).to_bytes(1, "little")
+        await client.write_gatt_char(POWER_CHAR, power_byte, True)
+        _LOGGER.debug("Set power to %s.", power)
+        self._state.power = power
+
+        # Re-send other values that may have been changed while ooler is not running,
+        # they are not updated unless on.
+        if power:
+            await self.set_mode(self._state.mode)
+            await self.set_temperature(self._state.set_temperature)
 
     async def set_mode(self, mode: str) -> None:
-        client = self._client
-        if client is not None:
-            mode_int = MODE_INT_TO_MODE_STATE.index(mode)
-            mode_byte = mode_int.to_bytes(1, "little")
-            await client.write_gatt_char(MODE_CHAR, mode_byte, True)
-            _LOGGER.debug("Set mode to %s.", mode)
-            self._state.mode = mode
-        else:
-            _LOGGER.debug("Tried to set mode, but BleakClient is None.")
-            # Probably should adjust this since it could create an infinite loop.
+        if self._client is None:
             await self.connect()
-            await self.set_mode(mode)
+        client = self._client
+        if client is None:
+            raise RuntimeError("Failed to connect to device")
+        mode_int = MODE_INT_TO_MODE_STATE.index(mode)
+        mode_byte = mode_int.to_bytes(1, "little")
+        await client.write_gatt_char(MODE_CHAR, mode_byte, True)
+        _LOGGER.debug("Set mode to %s.", mode)
+        self._state.mode = mode
 
     async def set_temperature(self, settemp_int: int) -> None:
-        client = self._client
-        if client is not None:
-            settemp_byte = settemp_int.to_bytes(1, "little")
-            await client.write_gatt_char(SETTEMP_CHAR, settemp_byte, True)
-            _LOGGER.debug("Set temperature to %s.", settemp_int)
-            self._state.set_temperature = settemp_int
-        else:
-            _LOGGER.debug("Tried to set temperature, but BleakClient is None.")
-            # Probably should adjust this since it could create an infinite loop.
+        if self._client is None:
             await self.connect()
-            await self.set_temperature(settemp_int)
+        client = self._client
+        if client is None:
+            raise RuntimeError("Failed to connect to device")
+        settemp_byte = settemp_int.to_bytes(1, "little")
+        await client.write_gatt_char(SETTEMP_CHAR, settemp_byte, True)
+        _LOGGER.debug("Set temperature to %s.", settemp_int)
+        self._state.set_temperature = settemp_int
 
     async def set_clean(self, clean: bool) -> None:
-        client = self._client
-        if client is not None:
-            # Turn on first else clean will not be active.
-            await self.set_power(True)
-
-            clean_byte = int(clean).to_bytes(1, "little")
-            await client.write_gatt_char(CLEAN_CHAR, clean_byte, True)
-            _LOGGER.debug("Set clean to %s.", clean)
-            self._state.clean = clean
-        else:
-            _LOGGER.debug("Tried to set clean, but BleakClient is None.")
-            # Probably should adjust this since it could create an infinite loop.
+        if self._client is None:
             await self.connect()
-            await self.set_clean(clean)
+        client = self._client
+        if client is None:
+            raise RuntimeError("Failed to connect to device")
+        # Turn on first else clean will not be active.
+        await self.set_power(True)
 
-    def _reset_disconnect_timer(self) -> None:
-        """Reset disconnect timer."""
-        if self._disconnect_timer:
-            self._disconnect_timer.cancel()
-        if DISCONNECT_DELAY > 0:
-            self._disconnect_timer = self._loop.call_later(
-                DISCONNECT_DELAY, self._disconnect
-            )
+        clean_byte = int(clean).to_bytes(1, "little")
+        await client.write_gatt_char(CLEAN_CHAR, clean_byte, True)
+        _LOGGER.debug("Set clean to %s.", clean)
+        self._state.clean = clean
 
     def _disconnected_callback(self, client: BleakClient) -> None:
         """Disconnected callback."""
-        _LOGGER.debug("%s: Disconnected from device", self._model_id)
-        self._state.connected = False
+        if self._expected_disconnect:
+            _LOGGER.debug("%s: Expected disconnect from device", self._model_id)
+        else:
+            _LOGGER.warning("%s: Unexpectedly disconnected from device", self._model_id)
+        self._expected_disconnect = False
         self._fire_callbacks()
-
-    def _disconnect(self) -> None:
-        """Disconnect from device."""
-        self._disconnect_timer = None
-        asyncio.create_task(self._execute_timed_disconnect())
-
-    async def _execute_timed_disconnect(self) -> None:
-        """Execute timed disconnection."""
-        _LOGGER.debug(
-            "%s: Disconnecting after timeout of %s",
-            self._model_id,
-            DISCONNECT_DELAY,
-        )
-        await self._execute_disconnect()
 
     async def _execute_disconnect(self) -> None:
         """Execute disconnection."""

@@ -1,7 +1,7 @@
-from .client import OolerBLEDevice, OolerBLEState, test_connection
+from .client import OolerBLEDevice
+from .models import OolerBLEState
 
 __all__ = [
     "OolerBLEDevice",
     "OolerBLEState",
-    "test_connection",
 ]
