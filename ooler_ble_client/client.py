@@ -21,11 +21,21 @@ from .const import (
     SETTEMP_CHAR,
     ACTUALTEMP_CHAR,
     WATER_LEVEL_CHAR,
-    PUMP_WATTS_CHAR,
     CLEAN_CHAR,
+    DISPLAY_TEMPERATURE_UNIT_CHAR,
 )
 
 WrapFuncType = TypeVar("WrapFuncType", bound=Callable[..., Any])
+
+
+def _f_to_c(f: int) -> int:
+    """Convert Fahrenheit to Celsius (rounded)."""
+    return round((f - 32) * 5 / 9)
+
+
+def _c_to_f(c: int) -> int:
+    """Convert Celsius to Fahrenheit (rounded)."""
+    return round(c * 9 / 5 + 32)
 
 
 
@@ -126,7 +136,7 @@ class OolerBLEDevice:
             await client.start_notify(SETTEMP_CHAR, self._notification_handler)
             await client.start_notify(ACTUALTEMP_CHAR, self._notification_handler)
             await client.start_notify(WATER_LEVEL_CHAR, self._notification_handler)
-            await client.start_notify(PUMP_WATTS_CHAR, self._notification_handler)
+
             await client.start_notify(CLEAN_CHAR, self._notification_handler)
 
     def _notification_handler(
@@ -148,17 +158,17 @@ class OolerBLEDevice:
             mode = MODE_INT_TO_MODE_STATE[mode_int]
             self._state.mode = mode
         elif uuid == SETTEMP_CHAR:
-            settemp_int = int.from_bytes(data, "little")
-            self._state.set_temperature = settemp_int
+            # SETTEMP_CHAR always reports in Fahrenheit
+            settemp_f = int.from_bytes(data, "little")
+            self._state.set_temperature = (
+                _f_to_c(settemp_f) if self._state.temperature_unit == "C" else settemp_f
+            )
         elif uuid == ACTUALTEMP_CHAR:
             actualtemp_int = int.from_bytes(data, "little")
             self._state.actual_temperature = actualtemp_int
         elif uuid == WATER_LEVEL_CHAR:
             waterlevel_int = int.from_bytes(data, "little")
             self._state.water_level = waterlevel_int
-        elif uuid == PUMP_WATTS_CHAR:
-            pumpwatts_int = int.from_bytes(data, "little")
-            self._state.pump_watts = pumpwatts_int
         elif uuid == CLEAN_CHAR:
             clean = bool(int.from_bytes(data, "little"))
             self._state.clean = clean
@@ -175,27 +185,32 @@ class OolerBLEDevice:
         settemp_byte = await client.read_gatt_char(SETTEMP_CHAR)
         actualtemp_byte = await client.read_gatt_char(ACTUALTEMP_CHAR)
         waterlevel_byte = await client.read_gatt_char(WATER_LEVEL_CHAR)
-        pumpwatts_byte = await client.read_gatt_char(PUMP_WATTS_CHAR)
         clean_byte = await client.read_gatt_char(CLEAN_CHAR)
+        temp_unit_byte = await client.read_gatt_char(DISPLAY_TEMPERATURE_UNIT_CHAR)
 
         power = bool(int.from_bytes(power_byte, "little"))
         mode_int = int.from_bytes(mode_byte, "little")
         mode = MODE_INT_TO_MODE_STATE[mode_int]
-        settemp_int = int.from_bytes(settemp_byte, "little")
+        # SETTEMP_CHAR is always in Fahrenheit regardless of display unit.
+        # ACTUALTEMP_CHAR is in whatever the display unit is set to.
+        settemp_f = int.from_bytes(settemp_byte, "little")
         actualtemp_int = int.from_bytes(actualtemp_byte, "little")
         waterlevel_int = int.from_bytes(waterlevel_byte, "little")
-        pumpwatts_int = int.from_bytes(pumpwatts_byte, "little")
         clean = bool(int.from_bytes(clean_byte, "little"))
+        temperature_unit = "C" if int.from_bytes(temp_unit_byte, "little") == 1 else "F"
+
+        # Convert set_temperature from F to display unit for consistent state
+        set_temperature = _f_to_c(settemp_f) if temperature_unit == "C" else settemp_f
 
         self._set_state_and_fire_callbacks(
             OolerBLEState(
                 power=power,
                 mode=mode,
-                set_temperature=settemp_int,
+                set_temperature=set_temperature,
                 actual_temperature=actualtemp_int,
                 water_level=waterlevel_int,
-                pump_watts=pumpwatts_int,
                 clean=clean,
+                temperature_unit=temperature_unit,
             )
         )
         _LOGGER.debug("%s: State retrieved.", self._model_id)
@@ -230,14 +245,17 @@ class OolerBLEDevice:
         self._state.mode = mode
 
     async def set_temperature(self, settemp_int: int) -> None:
+        """Set target temperature. Value should be in the current display unit."""
         if self._client is None:
             await self.connect()
         client = self._client
         if client is None:
             raise RuntimeError("Failed to connect to device")
-        settemp_byte = settemp_int.to_bytes(1, "little")
+        # SETTEMP_CHAR always expects Fahrenheit — convert if display unit is C
+        settemp_f = _c_to_f(settemp_int) if self._state.temperature_unit == "C" else settemp_int
+        settemp_byte = settemp_f.to_bytes(1, "little")
         await client.write_gatt_char(SETTEMP_CHAR, settemp_byte, True)
-        _LOGGER.debug("Set temperature to %s.", settemp_int)
+        _LOGGER.debug("Set temperature to %s (wrote %s°F to device).", settemp_int, settemp_f)
         self._state.set_temperature = settemp_int
 
     async def set_clean(self, clean: bool) -> None:
@@ -253,6 +271,17 @@ class OolerBLEDevice:
         await client.write_gatt_char(CLEAN_CHAR, clean_byte, True)
         _LOGGER.debug("Set clean to %s.", clean)
         self._state.clean = clean
+
+    async def set_temperature_unit(self, unit: str) -> None:
+        if self._client is None:
+            await self.connect()
+        client = self._client
+        if client is None:
+            raise RuntimeError("Failed to connect to device")
+        unit_byte = (1 if unit == "C" else 0).to_bytes(1, "little")
+        await client.write_gatt_char(DISPLAY_TEMPERATURE_UNIT_CHAR, unit_byte, True)
+        _LOGGER.debug("Set temperature unit to %s.", unit)
+        self._state.temperature_unit = unit
 
     def _disconnected_callback(self, client: BleakClient) -> None:
         """Disconnected callback."""
@@ -275,6 +304,6 @@ class OolerBLEDevice:
                 await client.stop_notify(SETTEMP_CHAR)
                 await client.stop_notify(ACTUALTEMP_CHAR)
                 await client.stop_notify(WATER_LEVEL_CHAR)
-                await client.stop_notify(PUMP_WATTS_CHAR)
+
                 await client.stop_notify(CLEAN_CHAR)
                 await client.disconnect()
