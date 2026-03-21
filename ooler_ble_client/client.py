@@ -136,7 +136,6 @@ class OolerBLEDevice:
             await client.start_notify(SETTEMP_CHAR, self._notification_handler)
             await client.start_notify(ACTUALTEMP_CHAR, self._notification_handler)
             await client.start_notify(WATER_LEVEL_CHAR, self._notification_handler)
-
             await client.start_notify(CLEAN_CHAR, self._notification_handler)
 
     def _notification_handler(
@@ -285,6 +284,9 @@ class OolerBLEDevice:
 
     def _disconnected_callback(self, client: BleakClient) -> None:
         """Disconnected callback."""
+        # Clear client immediately so is_connected returns False,
+        # allowing the integration's BLE callback to trigger reconnection.
+        self._client = None
         if self._expected_disconnect:
             _LOGGER.debug("%s: Expected disconnect from device", self._model_id)
         else:
@@ -304,6 +306,5 @@ class OolerBLEDevice:
                 await client.stop_notify(SETTEMP_CHAR)
                 await client.stop_notify(ACTUALTEMP_CHAR)
                 await client.stop_notify(WATER_LEVEL_CHAR)
-
                 await client.stop_notify(CLEAN_CHAR)
                 await client.disconnect()
