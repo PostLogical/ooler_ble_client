@@ -1,6 +1,6 @@
 [project]
 name = "ooler-ble-client"
-version = "0.8.3b1"
+version = "0.8.4b1"
 description = "A library to communicate with Ooler Sleep System Bluetooth devices."
 readme = "README.md"
 license = "Apache-2.0"

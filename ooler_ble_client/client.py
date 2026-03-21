@@ -128,15 +128,25 @@ class OolerBLEDevice:
             )
             _LOGGER.debug("%s: Connected", self._model_id)
             self._client = client
-            _LOGGER.debug("%s: Attempt to retrieve initial state.", self._model_id)
-            await self.async_poll()
-            _LOGGER.debug("%s: Subscribe to notifications", self._model_id)
-            await client.start_notify(POWER_CHAR, self._notification_handler)
-            await client.start_notify(MODE_CHAR, self._notification_handler)
-            await client.start_notify(SETTEMP_CHAR, self._notification_handler)
-            await client.start_notify(ACTUALTEMP_CHAR, self._notification_handler)
-            await client.start_notify(WATER_LEVEL_CHAR, self._notification_handler)
-            await client.start_notify(CLEAN_CHAR, self._notification_handler)
+            try:
+                _LOGGER.debug("%s: Attempt to retrieve initial state.", self._model_id)
+                await self.async_poll()
+                _LOGGER.debug("%s: Subscribe to notifications", self._model_id)
+                await client.start_notify(POWER_CHAR, self._notification_handler)
+                await client.start_notify(MODE_CHAR, self._notification_handler)
+                await client.start_notify(SETTEMP_CHAR, self._notification_handler)
+                await client.start_notify(ACTUALTEMP_CHAR, self._notification_handler)
+                await client.start_notify(WATER_LEVEL_CHAR, self._notification_handler)
+                await client.start_notify(CLEAN_CHAR, self._notification_handler)
+            except Exception:
+                _LOGGER.warning(
+                    "%s: Failed during post-connect setup, disconnecting",
+                    self._model_id,
+                    exc_info=True,
+                )
+                self._client = None
+                await client.disconnect()
+                raise
 
     def _notification_handler(
         self, _sender: BleakGATTCharacteristic, data: bytearray
