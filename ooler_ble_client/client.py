@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from typing import Any, TypeVar
 
 from bleak.backends.device import BLEDevice
-from bleak.backends.scanner import AdvertisementData
-from bleak.backends.service import BleakGATTServiceCollection
 from bleak.backends.characteristic import BleakGATTCharacteristic
-from bleak.exc import BleakDBusError
+from bleak.exc import BleakError
 from bleak import BleakClient
 from bleak_retry_connector import establish_connection
 
@@ -36,8 +34,6 @@ def _f_to_c(f: int) -> int:
 def _c_to_f(c: int) -> int:
     """Convert Celsius to Fahrenheit (rounded)."""
     return round(c * 9 / 5 + 32)
-
-
 
 
 class OolerBLEDevice:
@@ -129,15 +125,20 @@ class OolerBLEDevice:
             _LOGGER.debug("%s: Connected", self._model_id)
             self._client = client
             try:
+                # Read temperature unit once on connect (rarely changes)
+                temp_unit_byte = await client.read_gatt_char(DISPLAY_TEMPERATURE_UNIT_CHAR)
+                self._state.temperature_unit = (
+                    "C" if int.from_bytes(temp_unit_byte, "little") == 1 else "F"
+                )
                 _LOGGER.debug("%s: Attempt to retrieve initial state.", self._model_id)
                 await self.async_poll()
                 _LOGGER.debug("%s: Subscribe to notifications", self._model_id)
+                # Only subscribe to 4 notifications to stay within ESP32 proxy limits
+                # (12 global notification slots). Water level and clean are polled instead.
                 await client.start_notify(POWER_CHAR, self._notification_handler)
                 await client.start_notify(MODE_CHAR, self._notification_handler)
                 await client.start_notify(SETTEMP_CHAR, self._notification_handler)
                 await client.start_notify(ACTUALTEMP_CHAR, self._notification_handler)
-                await client.start_notify(WATER_LEVEL_CHAR, self._notification_handler)
-                await client.start_notify(CLEAN_CHAR, self._notification_handler)
             except Exception:
                 _LOGGER.warning(
                     "%s: Failed during post-connect setup, disconnecting",
@@ -175,19 +176,13 @@ class OolerBLEDevice:
         elif uuid == ACTUALTEMP_CHAR:
             actualtemp_int = int.from_bytes(data, "little")
             self._state.actual_temperature = actualtemp_int
-        elif uuid == WATER_LEVEL_CHAR:
-            waterlevel_int = int.from_bytes(data, "little")
-            self._state.water_level = waterlevel_int
-        elif uuid == CLEAN_CHAR:
-            clean = bool(int.from_bytes(data, "little"))
-            self._state.clean = clean
         self._fire_callbacks()
 
-    async def async_poll(self) -> None:
-        """Retrieve state from device."""
+    async def _read_all_characteristics(self) -> OolerBLEState:
+        """Read all GATT characteristics and return a new state."""
         client = self._client
         if client is None:
-            return await self.connect()
+            raise BleakError("Not connected")
 
         power_byte = await client.read_gatt_char(POWER_CHAR)
         mode_byte = await client.read_gatt_char(MODE_CHAR)
@@ -195,7 +190,6 @@ class OolerBLEDevice:
         actualtemp_byte = await client.read_gatt_char(ACTUALTEMP_CHAR)
         waterlevel_byte = await client.read_gatt_char(WATER_LEVEL_CHAR)
         clean_byte = await client.read_gatt_char(CLEAN_CHAR)
-        temp_unit_byte = await client.read_gatt_char(DISPLAY_TEMPERATURE_UNIT_CHAR)
 
         power = bool(int.from_bytes(power_byte, "little"))
         mode_int = int.from_bytes(mode_byte, "little")
@@ -206,32 +200,78 @@ class OolerBLEDevice:
         actualtemp_int = int.from_bytes(actualtemp_byte, "little")
         waterlevel_int = int.from_bytes(waterlevel_byte, "little")
         clean = bool(int.from_bytes(clean_byte, "little"))
-        temperature_unit = "C" if int.from_bytes(temp_unit_byte, "little") == 1 else "F"
 
-        # Convert set_temperature from F to display unit for consistent state
+        # Use cached temperature_unit (read once on connect)
+        temperature_unit = self._state.temperature_unit or "F"
         set_temperature = _f_to_c(settemp_f) if temperature_unit == "C" else settemp_f
 
-        self._set_state_and_fire_callbacks(
-            OolerBLEState(
-                power=power,
-                mode=mode,
-                set_temperature=set_temperature,
-                actual_temperature=actualtemp_int,
-                water_level=waterlevel_int,
-                clean=clean,
-                temperature_unit=temperature_unit,
-            )
+        return OolerBLEState(
+            power=power,
+            mode=mode,
+            set_temperature=set_temperature,
+            actual_temperature=actualtemp_int,
+            water_level=waterlevel_int,
+            clean=clean,
+            temperature_unit=temperature_unit,
         )
+
+    async def async_poll(self) -> None:
+        """Retrieve state from device."""
+        if self._client is None:
+            return await self.connect()
+
+        try:
+            state = await self._read_all_characteristics()
+        except BleakError:
+            if self._connect_lock.locked():
+                raise  # Called from _ensure_connected, let its handler deal with it
+            _LOGGER.warning(
+                "%s: Poll failed, attempting reconnect", self._model_id
+            )
+            await self._execute_forced_reconnect()
+            state = await self._read_all_characteristics()
+
+        self._set_state_and_fire_callbacks(state)
         _LOGGER.debug("%s: State retrieved.", self._model_id)
+
+    async def _retry_on_stale(self, operation: Callable[[], Coroutine]) -> Any:
+        """Execute a GATT operation; on BleakError, reconnect and retry once."""
+        try:
+            return await operation()
+        except BleakError as err:
+            _LOGGER.warning(
+                "%s: GATT operation failed (%s), attempting reconnect",
+                self._model_id,
+                err,
+            )
+            await self._execute_forced_reconnect()
+            return await operation()
+
+    async def _execute_forced_reconnect(self) -> None:
+        """Force disconnect and reconnect."""
+        _LOGGER.debug("%s: Forcing reconnect", self._model_id)
+        self._expected_disconnect = True
+        client = self._client
+        self._client = None
+        if client:
+            try:
+                await client.disconnect()
+            except Exception:
+                _LOGGER.debug(
+                    "%s: Disconnect during forced reconnect failed, ignoring",
+                    self._model_id,
+                )
+        await self._ensure_connected()
 
     async def set_power(self, power: bool) -> None:
         if self._client is None:
             await self.connect()
-        client = self._client
-        if client is None:
+        if self._client is None:
             raise RuntimeError("Failed to connect to device")
         power_byte = int(power).to_bytes(1, "little")
-        await client.write_gatt_char(POWER_CHAR, power_byte, True)
+        await self._retry_on_stale(
+            lambda: self._client.write_gatt_char(POWER_CHAR, power_byte, True)
+        )
         _LOGGER.debug("Set power to %s.", power)
         self._state.power = power
 
@@ -244,12 +284,13 @@ class OolerBLEDevice:
     async def set_mode(self, mode: str) -> None:
         if self._client is None:
             await self.connect()
-        client = self._client
-        if client is None:
+        if self._client is None:
             raise RuntimeError("Failed to connect to device")
         mode_int = MODE_INT_TO_MODE_STATE.index(mode)
         mode_byte = mode_int.to_bytes(1, "little")
-        await client.write_gatt_char(MODE_CHAR, mode_byte, True)
+        await self._retry_on_stale(
+            lambda: self._client.write_gatt_char(MODE_CHAR, mode_byte, True)
+        )
         _LOGGER.debug("Set mode to %s.", mode)
         self._state.mode = mode
 
@@ -257,38 +298,41 @@ class OolerBLEDevice:
         """Set target temperature. Value should be in the current display unit."""
         if self._client is None:
             await self.connect()
-        client = self._client
-        if client is None:
+        if self._client is None:
             raise RuntimeError("Failed to connect to device")
         # SETTEMP_CHAR always expects Fahrenheit — convert if display unit is C
         settemp_f = _c_to_f(settemp_int) if self._state.temperature_unit == "C" else settemp_int
         settemp_byte = settemp_f.to_bytes(1, "little")
-        await client.write_gatt_char(SETTEMP_CHAR, settemp_byte, True)
+        await self._retry_on_stale(
+            lambda: self._client.write_gatt_char(SETTEMP_CHAR, settemp_byte, True)
+        )
         _LOGGER.debug("Set temperature to %s (wrote %s°F to device).", settemp_int, settemp_f)
         self._state.set_temperature = settemp_int
 
     async def set_clean(self, clean: bool) -> None:
         if self._client is None:
             await self.connect()
-        client = self._client
-        if client is None:
+        if self._client is None:
             raise RuntimeError("Failed to connect to device")
         # Turn on first else clean will not be active.
         await self.set_power(True)
 
         clean_byte = int(clean).to_bytes(1, "little")
-        await client.write_gatt_char(CLEAN_CHAR, clean_byte, True)
+        await self._retry_on_stale(
+            lambda: self._client.write_gatt_char(CLEAN_CHAR, clean_byte, True)
+        )
         _LOGGER.debug("Set clean to %s.", clean)
         self._state.clean = clean
 
     async def set_temperature_unit(self, unit: str) -> None:
         if self._client is None:
             await self.connect()
-        client = self._client
-        if client is None:
+        if self._client is None:
             raise RuntimeError("Failed to connect to device")
         unit_byte = (1 if unit == "C" else 0).to_bytes(1, "little")
-        await client.write_gatt_char(DISPLAY_TEMPERATURE_UNIT_CHAR, unit_byte, True)
+        await self._retry_on_stale(
+            lambda: self._client.write_gatt_char(DISPLAY_TEMPERATURE_UNIT_CHAR, unit_byte, True)
+        )
         _LOGGER.debug("Set temperature unit to %s.", unit)
         self._state.temperature_unit = unit
 
@@ -315,6 +359,4 @@ class OolerBLEDevice:
                 await client.stop_notify(MODE_CHAR)
                 await client.stop_notify(SETTEMP_CHAR)
                 await client.stop_notify(ACTUALTEMP_CHAR)
-                await client.stop_notify(WATER_LEVEL_CHAR)
-                await client.stop_notify(CLEAN_CHAR)
                 await client.disconnect()
