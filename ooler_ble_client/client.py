@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Coroutine
-from typing import Any, TypeVar
+from typing import Any
 
 from bleak.backends.device import BLEDevice
 from bleak.backends.characteristic import BleakGATTCharacteristic
@@ -23,7 +23,11 @@ from .const import (
     DISPLAY_TEMPERATURE_UNIT_CHAR,
 )
 
-WrapFuncType = TypeVar("WrapFuncType", bound=Callable[..., Any])
+# Valid temperature range for the Ooler (Fahrenheit)
+_MIN_TEMP_F = 55
+_MAX_TEMP_F = 115
+
+_RECONNECT_BACKOFF_SECONDS = 0.5
 
 
 def _f_to_c(f: int) -> int:
@@ -119,6 +123,7 @@ class OolerBLEDevice:
                 self._ble_device,
                 self._model_id,
                 self._disconnected_callback,
+                max_attempts=5,
                 use_services_cache=True,
                 ble_device_callback=lambda: self._ble_device,
             )
@@ -153,30 +158,48 @@ class OolerBLEDevice:
         self, _sender: BleakGATTCharacteristic, data: bytearray
     ) -> None:
         """Handle notification responses."""
-        uuid = _sender.uuid
-        _LOGGER.debug(
-            "%s: Notification received: %s from %s", self._model_id, data.hex(), uuid
-        )
-        if uuid == POWER_CHAR:
-            power = bool(int.from_bytes(data, "little"))
-            self._state.power = power
-            # OFF ends clean. Similarly, when clean mode ends, the device only sends OFF.
-            if not power:
-                self._state.clean = False
-        elif uuid == MODE_CHAR:
-            mode_int = int.from_bytes(data, "little")
-            mode = MODE_INT_TO_MODE_STATE[mode_int]
-            self._state.mode = mode
-        elif uuid == SETTEMP_CHAR:
-            # SETTEMP_CHAR always reports in Fahrenheit
-            settemp_f = int.from_bytes(data, "little")
-            self._state.set_temperature = (
-                _f_to_c(settemp_f) if self._state.temperature_unit == "C" else settemp_f
+        try:
+            uuid = _sender.uuid
+            _LOGGER.debug(
+                "%s: Notification received: %s from %s",
+                self._model_id,
+                data.hex(),
+                uuid,
             )
-        elif uuid == ACTUALTEMP_CHAR:
-            actualtemp_int = int.from_bytes(data, "little")
-            self._state.actual_temperature = actualtemp_int
-        self._fire_callbacks()
+            if uuid == POWER_CHAR:
+                power = bool(int.from_bytes(data, "little"))
+                self._state.power = power
+                # OFF ends clean. Similarly, when clean mode ends, the device only sends OFF.
+                if not power:
+                    self._state.clean = False
+            elif uuid == MODE_CHAR:
+                mode_int = int.from_bytes(data, "little")
+                if 0 <= mode_int < len(MODE_INT_TO_MODE_STATE):
+                    self._state.mode = MODE_INT_TO_MODE_STATE[mode_int]
+                else:
+                    _LOGGER.warning(
+                        "%s: Unknown mode value: %s", self._model_id, mode_int
+                    )
+                    return
+            elif uuid == SETTEMP_CHAR:
+                # SETTEMP_CHAR always reports in Fahrenheit
+                settemp_f = int.from_bytes(data, "little")
+                self._state.set_temperature = (
+                    _f_to_c(settemp_f)
+                    if self._state.temperature_unit == "C"
+                    else settemp_f
+                )
+            elif uuid == ACTUALTEMP_CHAR:
+                actualtemp_int = int.from_bytes(data, "little")
+                self._state.actual_temperature = actualtemp_int
+            self._fire_callbacks()
+        except Exception:
+            _LOGGER.warning(
+                "%s: Error handling notification from %s",
+                self._model_id,
+                _sender.uuid,
+                exc_info=True,
+            )
 
     async def _read_all_characteristics(self) -> OolerBLEState:
         """Read all GATT characteristics and return a new state."""
@@ -193,7 +216,13 @@ class OolerBLEDevice:
 
         power = bool(int.from_bytes(power_byte, "little"))
         mode_int = int.from_bytes(mode_byte, "little")
-        mode = MODE_INT_TO_MODE_STATE[mode_int]
+        if 0 <= mode_int < len(MODE_INT_TO_MODE_STATE):
+            mode = MODE_INT_TO_MODE_STATE[mode_int]
+        else:
+            _LOGGER.warning(
+                "%s: Unknown mode value during poll: %s", self._model_id, mode_int
+            )
+            mode = self._state.mode
         # SETTEMP_CHAR is always in Fahrenheit regardless of display unit.
         # ACTUALTEMP_CHAR is in whatever the display unit is set to.
         settemp_f = int.from_bytes(settemp_byte, "little")
@@ -261,6 +290,8 @@ class OolerBLEDevice:
                     "%s: Disconnect during forced reconnect failed, ignoring",
                     self._model_id,
                 )
+        # Brief delay to let the BLE stack clean up before reconnecting
+        await asyncio.sleep(_RECONNECT_BACKOFF_SECONDS)
         await self._ensure_connected()
 
     async def set_power(self, power: bool) -> None:
@@ -276,12 +307,17 @@ class OolerBLEDevice:
         self._state.power = power
 
         # Re-send other values that may have been changed while ooler is not running,
-        # they are not updated unless on.
-        if power:
+        # they are not updated unless on. Only re-send if state has been populated.
+        if power and self._state.mode is not None:
             await self.set_mode(self._state.mode)
+        if power and self._state.set_temperature is not None:
             await self.set_temperature(self._state.set_temperature)
 
     async def set_mode(self, mode: str) -> None:
+        if mode not in MODE_INT_TO_MODE_STATE:
+            raise ValueError(
+                f"Invalid mode '{mode}'. Must be one of: {MODE_INT_TO_MODE_STATE}"
+            )
         if self._client is None:
             await self.connect()
         if self._client is None:
@@ -301,12 +337,23 @@ class OolerBLEDevice:
         if self._client is None:
             raise RuntimeError("Failed to connect to device")
         # SETTEMP_CHAR always expects Fahrenheit — convert if display unit is C
-        settemp_f = _c_to_f(settemp_int) if self._state.temperature_unit == "C" else settemp_int
+        settemp_f = (
+            _c_to_f(settemp_int)
+            if self._state.temperature_unit == "C"
+            else settemp_int
+        )
+        if not _MIN_TEMP_F <= settemp_f <= _MAX_TEMP_F:
+            raise ValueError(
+                f"Temperature {settemp_int} (={settemp_f}°F) out of range "
+                f"({_MIN_TEMP_F}-{_MAX_TEMP_F}°F)"
+            )
         settemp_byte = settemp_f.to_bytes(1, "little")
         await self._retry_on_stale(
             lambda: self._client.write_gatt_char(SETTEMP_CHAR, settemp_byte, True)
         )
-        _LOGGER.debug("Set temperature to %s (wrote %s°F to device).", settemp_int, settemp_f)
+        _LOGGER.debug(
+            "Set temperature to %s (wrote %s°F to device).", settemp_int, settemp_f
+        )
         self._state.set_temperature = settemp_int
 
     async def set_clean(self, clean: bool) -> None:
@@ -325,13 +372,17 @@ class OolerBLEDevice:
         self._state.clean = clean
 
     async def set_temperature_unit(self, unit: str) -> None:
+        if unit not in ("C", "F"):
+            raise ValueError(f"Invalid temperature unit '{unit}'. Must be 'C' or 'F'")
         if self._client is None:
             await self.connect()
         if self._client is None:
             raise RuntimeError("Failed to connect to device")
         unit_byte = (1 if unit == "C" else 0).to_bytes(1, "little")
         await self._retry_on_stale(
-            lambda: self._client.write_gatt_char(DISPLAY_TEMPERATURE_UNIT_CHAR, unit_byte, True)
+            lambda: self._client.write_gatt_char(
+                DISPLAY_TEMPERATURE_UNIT_CHAR, unit_byte, True
+            )
         )
         _LOGGER.debug("Set temperature unit to %s.", unit)
         self._state.temperature_unit = unit
@@ -344,7 +395,9 @@ class OolerBLEDevice:
         if self._expected_disconnect:
             _LOGGER.debug("%s: Expected disconnect from device", self._model_id)
         else:
-            _LOGGER.warning("%s: Unexpectedly disconnected from device", self._model_id)
+            _LOGGER.warning(
+                "%s: Unexpectedly disconnected from device", self._model_id
+            )
         self._expected_disconnect = False
         self._fire_callbacks()
 
@@ -355,8 +408,13 @@ class OolerBLEDevice:
             self._expected_disconnect = True
             self._client = None
             if client and client.is_connected:
-                await client.stop_notify(POWER_CHAR)
-                await client.stop_notify(MODE_CHAR)
-                await client.stop_notify(SETTEMP_CHAR)
-                await client.stop_notify(ACTUALTEMP_CHAR)
+                for char in (POWER_CHAR, MODE_CHAR, SETTEMP_CHAR, ACTUALTEMP_CHAR):
+                    try:
+                        await client.stop_notify(char)
+                    except Exception:
+                        _LOGGER.debug(
+                            "%s: Failed to unsubscribe from %s, ignoring",
+                            self._model_id,
+                            char,
+                        )
                 await client.disconnect()
