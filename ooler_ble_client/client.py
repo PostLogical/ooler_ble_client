@@ -7,8 +7,11 @@ from typing import Any
 from bleak.backends.device import BLEDevice
 from bleak.backends.characteristic import BleakGATTCharacteristic
 from bleak.exc import BleakError
-from bleak import BleakClient
-from bleak_retry_connector import establish_connection
+from bleak_retry_connector import (
+    BleakClientWithServiceCache,
+    BLEAK_RETRY_EXCEPTIONS,
+    establish_connection,
+)
 
 from .models import OolerBLEState
 from .const import (
@@ -47,7 +50,7 @@ class OolerBLEDevice:
         self._model_id = model
         self._state = OolerBLEState()
         self._connect_lock = asyncio.Lock()
-        self._client: BleakClient | None = None
+        self._client: BleakClientWithServiceCache | None = None
         self._callbacks: list[Callable[[OolerBLEState], None]] = []
         self._ble_device: BLEDevice | None = None
         self._expected_disconnect = False
@@ -119,7 +122,7 @@ class OolerBLEDevice:
                 raise RuntimeError("BLE device not set — call set_ble_device() first")
             _LOGGER.debug("%s: Connecting", self._model_id)
             client = await establish_connection(
-                BleakClient,
+                BleakClientWithServiceCache,
                 self._ble_device,
                 self._model_id,
                 self._disconnected_callback,
@@ -166,16 +169,23 @@ class OolerBLEDevice:
                 data.hex(),
                 uuid,
             )
+            changed = False
             if uuid == POWER_CHAR:
                 power = bool(int.from_bytes(data, "little"))
-                self._state.power = power
+                if self._state.power != power:
+                    self._state.power = power
+                    changed = True
                 # OFF ends clean. Similarly, when clean mode ends, the device only sends OFF.
-                if not power:
+                if not power and self._state.clean:
                     self._state.clean = False
+                    changed = True
             elif uuid == MODE_CHAR:
                 mode_int = int.from_bytes(data, "little")
                 if 0 <= mode_int < len(MODE_INT_TO_MODE_STATE):
-                    self._state.mode = MODE_INT_TO_MODE_STATE[mode_int]
+                    mode = MODE_INT_TO_MODE_STATE[mode_int]
+                    if self._state.mode != mode:
+                        self._state.mode = mode
+                        changed = True
                 else:
                     _LOGGER.warning(
                         "%s: Unknown mode value: %s", self._model_id, mode_int
@@ -184,15 +194,21 @@ class OolerBLEDevice:
             elif uuid == SETTEMP_CHAR:
                 # SETTEMP_CHAR always reports in Fahrenheit
                 settemp_f = int.from_bytes(data, "little")
-                self._state.set_temperature = (
+                set_temperature = (
                     _f_to_c(settemp_f)
                     if self._state.temperature_unit == "C"
                     else settemp_f
                 )
+                if self._state.set_temperature != set_temperature:
+                    self._state.set_temperature = set_temperature
+                    changed = True
             elif uuid == ACTUALTEMP_CHAR:
                 actualtemp_int = int.from_bytes(data, "little")
-                self._state.actual_temperature = actualtemp_int
-            self._fire_callbacks()
+                if self._state.actual_temperature != actualtemp_int:
+                    self._state.actual_temperature = actualtemp_int
+                    changed = True
+            if changed:
+                self._fire_callbacks()
         except Exception:
             _LOGGER.warning(
                 "%s: Error handling notification from %s",
@@ -251,7 +267,7 @@ class OolerBLEDevice:
 
         try:
             state = await self._read_all_characteristics()
-        except BleakError:
+        except BLEAK_RETRY_EXCEPTIONS:
             if self._connect_lock.locked():
                 raise  # Called from _ensure_connected, let its handler deal with it
             _LOGGER.warning(
@@ -264,17 +280,29 @@ class OolerBLEDevice:
         _LOGGER.debug("%s: State retrieved.", self._model_id)
 
     async def _retry_on_stale(self, operation: Callable[[], Coroutine]) -> Any:
-        """Execute a GATT operation; on BleakError, reconnect and retry once."""
+        """Execute a GATT operation with two levels of retry.
+
+        First retry: immediate (handles transient proxy hiccups).
+        Second retry: full reconnect (handles stale connections).
+        """
         try:
             return await operation()
-        except BleakError as err:
+        except BLEAK_RETRY_EXCEPTIONS:
+            _LOGGER.debug(
+                "%s: GATT operation failed, retrying immediately", self._model_id
+            )
+        # First retry: immediate, no reconnect
+        try:
+            return await operation()
+        except BLEAK_RETRY_EXCEPTIONS as err:
             _LOGGER.warning(
-                "%s: GATT operation failed (%s), attempting reconnect",
+                "%s: GATT operation failed twice (%s), reconnecting",
                 self._model_id,
                 err,
             )
-            await self._execute_forced_reconnect()
-            return await operation()
+        # Second retry: full reconnect
+        await self._execute_forced_reconnect()
+        return await operation()
 
     async def _execute_forced_reconnect(self) -> None:
         """Force disconnect and reconnect."""
@@ -294,24 +322,37 @@ class OolerBLEDevice:
         await asyncio.sleep(_RECONNECT_BACKOFF_SECONDS)
         await self._ensure_connected()
 
+    async def _write_gatt(self, char: str, data: bytes) -> None:
+        """Write to a GATT characteristic with retry-on-stale logic."""
+        await self._retry_on_stale(
+            lambda: self._client.write_gatt_char(char, data, True)
+        )
+
     async def set_power(self, power: bool) -> None:
         if self._client is None:
             await self.connect()
         if self._client is None:
             raise RuntimeError("Failed to connect to device")
         power_byte = int(power).to_bytes(1, "little")
-        await self._retry_on_stale(
-            lambda: self._client.write_gatt_char(POWER_CHAR, power_byte, True)
-        )
+        await self._write_gatt(POWER_CHAR, power_byte)
         _LOGGER.debug("Set power to %s.", power)
         self._state.power = power
 
-        # Re-send other values that may have been changed while ooler is not running,
-        # they are not updated unless on. Only re-send if state has been populated.
+        # When turning on, re-send mode and temperature to the device.
+        # These may have been changed in HA while the Ooler was off, and the
+        # device won't pick them up unless they're written after power-on.
+        # Write directly to GATT here instead of calling set_mode/set_temperature
+        # to keep this as a single atomic operation.
         if power and self._state.mode is not None:
-            await self.set_mode(self._state.mode)
+            mode_int = MODE_INT_TO_MODE_STATE.index(self._state.mode)
+            await self._write_gatt(MODE_CHAR, mode_int.to_bytes(1, "little"))
         if power and self._state.set_temperature is not None:
-            await self.set_temperature(self._state.set_temperature)
+            settemp_f = (
+                _c_to_f(self._state.set_temperature)
+                if self._state.temperature_unit == "C"
+                else self._state.set_temperature
+            )
+            await self._write_gatt(SETTEMP_CHAR, settemp_f.to_bytes(1, "little"))
 
     async def set_mode(self, mode: str) -> None:
         if mode not in MODE_INT_TO_MODE_STATE:
@@ -323,10 +364,7 @@ class OolerBLEDevice:
         if self._client is None:
             raise RuntimeError("Failed to connect to device")
         mode_int = MODE_INT_TO_MODE_STATE.index(mode)
-        mode_byte = mode_int.to_bytes(1, "little")
-        await self._retry_on_stale(
-            lambda: self._client.write_gatt_char(MODE_CHAR, mode_byte, True)
-        )
+        await self._write_gatt(MODE_CHAR, mode_int.to_bytes(1, "little"))
         _LOGGER.debug("Set mode to %s.", mode)
         self._state.mode = mode
 
@@ -347,10 +385,7 @@ class OolerBLEDevice:
                 f"Temperature {settemp_int} (={settemp_f}°F) out of range "
                 f"({_MIN_TEMP_F}-{_MAX_TEMP_F}°F)"
             )
-        settemp_byte = settemp_f.to_bytes(1, "little")
-        await self._retry_on_stale(
-            lambda: self._client.write_gatt_char(SETTEMP_CHAR, settemp_byte, True)
-        )
+        await self._write_gatt(SETTEMP_CHAR, settemp_f.to_bytes(1, "little"))
         _LOGGER.debug(
             "Set temperature to %s (wrote %s°F to device).", settemp_int, settemp_f
         )
@@ -364,10 +399,7 @@ class OolerBLEDevice:
         # Turn on first else clean will not be active.
         await self.set_power(True)
 
-        clean_byte = int(clean).to_bytes(1, "little")
-        await self._retry_on_stale(
-            lambda: self._client.write_gatt_char(CLEAN_CHAR, clean_byte, True)
-        )
+        await self._write_gatt(CLEAN_CHAR, int(clean).to_bytes(1, "little"))
         _LOGGER.debug("Set clean to %s.", clean)
         self._state.clean = clean
 
@@ -379,15 +411,11 @@ class OolerBLEDevice:
         if self._client is None:
             raise RuntimeError("Failed to connect to device")
         unit_byte = (1 if unit == "C" else 0).to_bytes(1, "little")
-        await self._retry_on_stale(
-            lambda: self._client.write_gatt_char(
-                DISPLAY_TEMPERATURE_UNIT_CHAR, unit_byte, True
-            )
-        )
+        await self._write_gatt(DISPLAY_TEMPERATURE_UNIT_CHAR, unit_byte)
         _LOGGER.debug("Set temperature unit to %s.", unit)
         self._state.temperature_unit = unit
 
-    def _disconnected_callback(self, client: BleakClient) -> None:
+    def _disconnected_callback(self, client: BleakClientWithServiceCache) -> None:
         """Disconnected callback."""
         # Clear client immediately so is_connected returns False,
         # allowing the integration's BLE callback to trigger reconnection.
