@@ -118,17 +118,18 @@ class OolerBLEDevice:
             # Check again while holding the lock
             if self.is_connected:
                 return
-            if self._ble_device is None:
+            ble_device = self._ble_device
+            if ble_device is None:
                 raise RuntimeError("BLE device not set — call set_ble_device() first")
             _LOGGER.debug("%s: Connecting", self._model_id)
             client = await establish_connection(
                 BleakClientWithServiceCache,
-                self._ble_device,
+                ble_device,
                 self._model_id,
                 self._disconnected_callback,
                 max_attempts=5,
                 use_services_cache=True,
-                ble_device_callback=lambda: self._ble_device,
+                ble_device_callback=lambda: self._ble_device or ble_device,
             )
             _LOGGER.debug("%s: Connected", self._model_id)
             self._client = client
@@ -238,7 +239,7 @@ class OolerBLEDevice:
             _LOGGER.warning(
                 "%s: Unknown mode value during poll: %s", self._model_id, mode_int
             )
-            mode = self._state.mode
+            mode = self._state.mode or "Silent"
         # SETTEMP_CHAR is always in Fahrenheit regardless of display unit.
         # ACTUALTEMP_CHAR is in whatever the display unit is set to.
         settemp_f = int.from_bytes(settemp_byte, "little")
@@ -279,7 +280,7 @@ class OolerBLEDevice:
         self._set_state_and_fire_callbacks(state)
         _LOGGER.debug("%s: State retrieved.", self._model_id)
 
-    async def _retry_on_stale(self, operation: Callable[[], Coroutine]) -> Any:
+    async def _retry_on_stale(self, operation: Callable[[], Coroutine[Any, Any, Any]]) -> Any:
         """Execute a GATT operation with two levels of retry.
 
         First retry: immediate (handles transient proxy hiccups).
@@ -324,9 +325,14 @@ class OolerBLEDevice:
 
     async def _write_gatt(self, char: str, data: bytes) -> None:
         """Write to a GATT characteristic with retry-on-stale logic."""
-        await self._retry_on_stale(
-            lambda: self._client.write_gatt_char(char, data, True)
-        )
+
+        async def _write() -> None:
+            client = self._client
+            if client is None:
+                raise BleakError("Not connected")
+            await client.write_gatt_char(char, data, True)
+
+        await self._retry_on_stale(_write)
 
     async def set_power(self, power: bool) -> None:
         if self._client is None:
