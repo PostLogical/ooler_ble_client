@@ -1,10 +1,13 @@
 """Constants for the ooler_ble_client library."""
+from __future__ import annotations
+
 import logging
+
+from .models import OolerMode
 
 _LOGGER = logging.getLogger(__package__)
 
-
-MODE_INT_TO_MODE_STATE = ["Silent", "Regular", "Boost"]
+MODE_INT_TO_MODE_STATE: list[OolerMode] = ["Silent", "Regular", "Boost"]
 
 POWER_CHAR = "7a2623ff-bd92-4c13-be9f-7023aa4ecb85"
 MODE_CHAR = "cafe2421-d04c-458f-b1c0-253c6c97e8e8"

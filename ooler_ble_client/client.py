@@ -13,7 +13,7 @@ from bleak_retry_connector import (
     establish_connection,
 )
 
-from .models import OolerBLEState
+from .models import OolerBLEState, OolerMode, TemperatureUnit
 from .const import (
     _LOGGER,
     MODE_INT_TO_MODE_STATE,
@@ -239,7 +239,7 @@ class OolerBLEDevice:
             _LOGGER.warning(
                 "%s: Unknown mode value during poll: %s", self._model_id, mode_int
             )
-            mode = self._state.mode or "Silent"
+            mode = self._state.mode or "Regular"
         # SETTEMP_CHAR is always in Fahrenheit regardless of display unit.
         # ACTUALTEMP_CHAR is in whatever the display unit is set to.
         settemp_f = int.from_bytes(settemp_byte, "little")
@@ -360,7 +360,7 @@ class OolerBLEDevice:
             )
             await self._write_gatt(SETTEMP_CHAR, settemp_f.to_bytes(1, "little"))
 
-    async def set_mode(self, mode: str) -> None:
+    async def set_mode(self, mode: OolerMode) -> None:
         if mode not in MODE_INT_TO_MODE_STATE:
             raise ValueError(
                 f"Invalid mode '{mode}'. Must be one of: {MODE_INT_TO_MODE_STATE}"
@@ -409,7 +409,7 @@ class OolerBLEDevice:
         _LOGGER.debug("Set clean to %s.", clean)
         self._state.clean = clean
 
-    async def set_temperature_unit(self, unit: str) -> None:
+    async def set_temperature_unit(self, unit: TemperatureUnit) -> None:
         if unit not in ("C", "F"):
             raise ValueError(f"Invalid temperature unit '{unit}'. Must be 'C' or 'F'")
         if self._client is None:
