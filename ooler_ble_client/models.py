@@ -3,8 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
+from bleak.exc import BleakError
+
 OolerMode = Literal["Silent", "Regular", "Boost"]
 TemperatureUnit = Literal["C", "F"]
+
+
+class OolerConnectionError(BleakError):
+    """Raised when all retry attempts are exhausted."""
 
 
 @dataclass

@@ -13,7 +13,7 @@ from bleak_retry_connector import (
     establish_connection,
 )
 
-from .models import OolerBLEState, OolerMode, TemperatureUnit
+from .models import OolerBLEState, OolerConnectionError, OolerMode, TemperatureUnit
 from .const import (
     _LOGGER,
     MODE_INT_TO_MODE_STATE,
@@ -275,7 +275,12 @@ class OolerBLEDevice:
                 "%s: Poll failed, attempting reconnect", self._model_id
             )
             await self._execute_forced_reconnect()
-            state = await self._read_all_characteristics()
+            try:
+                state = await self._read_all_characteristics()
+            except BLEAK_RETRY_EXCEPTIONS as err:
+                raise OolerConnectionError(
+                    f"{self._model_id}: Poll failed after reconnect: {err}"
+                ) from err
 
         self._set_state_and_fire_callbacks(state)
         _LOGGER.debug("%s: State retrieved.", self._model_id)
@@ -303,7 +308,12 @@ class OolerBLEDevice:
             )
         # Second retry: full reconnect
         await self._execute_forced_reconnect()
-        return await operation()
+        try:
+            return await operation()
+        except BLEAK_RETRY_EXCEPTIONS as err:
+            raise OolerConnectionError(
+                f"{self._model_id}: Operation failed after reconnect: {err}"
+            ) from err
 
     async def _execute_forced_reconnect(self) -> None:
         """Force disconnect and reconnect."""
