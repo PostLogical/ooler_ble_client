@@ -345,6 +345,7 @@ class OolerBLEDevice:
         await self._retry_on_stale(_write)
 
     async def set_power(self, power: bool) -> None:
+        """Turn the device on or off. Re-sends mode and temperature on power-on."""
         if self._client is None:
             await self.connect()
         if self._client is None:
@@ -371,6 +372,7 @@ class OolerBLEDevice:
             await self._write_gatt(SETTEMP_CHAR, settemp_f.to_bytes(1, "little"))
 
     async def set_mode(self, mode: OolerMode) -> None:
+        """Set pump mode: 'Silent', 'Regular', or 'Boost'."""
         if mode not in MODE_INT_TO_MODE_STATE:
             raise ValueError(
                 f"Invalid mode '{mode}'. Must be one of: {MODE_INT_TO_MODE_STATE}"
@@ -408,6 +410,7 @@ class OolerBLEDevice:
         self._state.set_temperature = settemp_int
 
     async def set_clean(self, clean: bool) -> None:
+        """Start or stop a clean cycle. Automatically powers on the device."""
         if self._client is None:
             await self.connect()
         if self._client is None:
@@ -420,6 +423,7 @@ class OolerBLEDevice:
         self._state.clean = clean
 
     async def set_temperature_unit(self, unit: TemperatureUnit) -> None:
+        """Set device display unit: 'C' or 'F'."""
         if unit not in ("C", "F"):
             raise ValueError(f"Invalid temperature unit '{unit}'. Must be 'C' or 'F'")
         if self._client is None:
@@ -431,7 +435,7 @@ class OolerBLEDevice:
         _LOGGER.debug("Set temperature unit to %s.", unit)
         self._state.temperature_unit = unit
 
-    def _disconnected_callback(self, client: BleakClientWithServiceCache) -> None:
+    def _disconnected_callback(self, client: BleakClientWithServiceCache | None) -> None:
         """Disconnected callback."""
         # Clear client immediately so is_connected returns False,
         # allowing the integration's BLE callback to trigger reconnection.
