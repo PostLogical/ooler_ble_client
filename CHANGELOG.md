@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.10.0
+
+### Added
+- **Sleep schedule support** -- read, write, and clear the device's weekly sleep schedule
+  - `SleepScheduleEvent` -- low-level wire-format event (minute-of-week + temperature)
+  - `SleepScheduleNight` -- structured night with temperature zones and per-night warm wake
+  - `OolerSleepSchedule` -- full weekly schedule as a list of nights
+  - `WarmWake` -- warm wake configuration (target temp + duration)
+  - `build_sleep_schedule()` -- convenience builder for uniform app-compatible schedules
+- `read_sleep_schedule()` -- read schedule from device (lazy, not on every connect)
+- `set_sleep_schedule()` -- write a structured schedule
+- `set_sleep_schedule_events()` -- write raw events for full control
+- `clear_sleep_schedule()` -- clear the device schedule
+- `sync_clock()` -- sync the device's internal clock with proper DST handling via `zoneinfo`
+- Schedule format fully decoded and documented in `sleep_schedule.py` and `const.py`
+- 347 tests with 100% code coverage
+
+### Fixed
+- Schedule service GATT write quirk: device byte-swaps uint16 values on write; client pre-swaps to compensate
+
 ## 0.9.0
 
 First stable release. Complete rewrite of connection management and error handling.
