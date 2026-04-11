@@ -321,18 +321,32 @@ class TestInputValidation:
             await device.set_temperature(30)
 
     @pytest.mark.asyncio
-    async def test_set_temperature_in_dead_zone_below(self) -> None:
-        """Values 46-54 are in a dead zone (device clamps to 45)."""
+    async def test_set_temperature_rejects_below_54(self) -> None:
+        """Values 46-53 are below the accepted range (except 45 LO)."""
         device, _ = _make_connected_device()
         with pytest.raises(ValueError, match="out of range"):
-            await device.set_temperature(50)
+            await device.set_temperature(53)
 
     @pytest.mark.asyncio
-    async def test_set_temperature_in_dead_zone_above(self) -> None:
-        """Values 116-119 are in a dead zone (device clamps to 120)."""
+    async def test_set_temperature_rejects_above_116(self) -> None:
+        """Values 117-119 are above the accepted range (except 120 HI)."""
         device, _ = _make_connected_device()
         with pytest.raises(ValueError, match="out of range"):
-            await device.set_temperature(118)
+            await device.set_temperature(117)
+
+    @pytest.mark.asyncio
+    async def test_set_temperature_accepts_54(self) -> None:
+        """54 is accepted (device clamps to LO)."""
+        device, client = _make_connected_device()
+        await device.set_temperature(54)
+        assert device.state.set_temperature == 54
+
+    @pytest.mark.asyncio
+    async def test_set_temperature_accepts_116(self) -> None:
+        """116 is accepted (device clamps to HI)."""
+        device, client = _make_connected_device()
+        await device.set_temperature(116)
+        assert device.state.set_temperature == 116
 
 
 class TestIsConnected:

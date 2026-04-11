@@ -46,10 +46,12 @@ def _c_to_f(c: int) -> int:
 def _is_valid_temp_f(temp_f: int) -> bool:
     """Check if a Fahrenheit temperature is valid for the Ooler.
 
-    Valid values: TEMP_LO_F (45), TEMP_MIN_F-TEMP_MAX_F (55-115), TEMP_HI_F (120).
-    The device clamps 46-54 to 45 and 116-119 to 120, so those are not valid inputs.
+    Valid values: TEMP_LO_F (45), 54-116, TEMP_HI_F (120).
+    The device clamps 46-54 to LO (45) and 116-119 to HI (120), so
+    54 and 116 are accepted as the integration's way to request LO/HI.
+    Values below 54 (except 45) or above 116 (except 120) are rejected.
     """
-    return temp_f in (TEMP_LO_F, TEMP_HI_F) or TEMP_MIN_F <= temp_f <= TEMP_MAX_F
+    return temp_f in (TEMP_LO_F, TEMP_HI_F) or 54 <= temp_f <= 116
 
 
 class OolerBLEDevice:
@@ -423,8 +425,7 @@ class OolerBLEDevice:
         if not _is_valid_temp_f(settemp_f):
             raise ValueError(
                 f"Temperature {settemp_int} (={settemp_f}°F) out of range. "
-                f"Valid: {TEMP_LO_F} (LO), {TEMP_MIN_F}-{TEMP_MAX_F}, "
-                f"or {TEMP_HI_F} (HI)"
+                f"Valid: {TEMP_LO_F} (LO), 54-116, or {TEMP_HI_F} (HI)"
             )
         if self._state.power:
             await self._write_gatt(SETTEMP_CHAR, settemp_f.to_bytes(1, "little"))
