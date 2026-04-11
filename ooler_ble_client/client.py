@@ -24,11 +24,11 @@ from .const import (
     WATER_LEVEL_CHAR,
     CLEAN_CHAR,
     DISPLAY_TEMPERATURE_UNIT_CHAR,
+    TEMP_LO_F,
+    TEMP_MIN_F,
+    TEMP_MAX_F,
+    TEMP_HI_F,
 )
-
-# Valid temperature range for the Ooler (Fahrenheit)
-_MIN_TEMP_F = 55
-_MAX_TEMP_F = 115
 
 _RECONNECT_BACKOFF_SECONDS = 0.5
 
@@ -41,6 +41,15 @@ def _f_to_c(f: int) -> int:
 def _c_to_f(c: int) -> int:
     """Convert Celsius to Fahrenheit (rounded)."""
     return round(c * 9 / 5 + 32)
+
+
+def _is_valid_temp_f(temp_f: int) -> bool:
+    """Check if a Fahrenheit temperature is valid for the Ooler.
+
+    Valid values: TEMP_LO_F (45), TEMP_MIN_F-TEMP_MAX_F (55-115), TEMP_HI_F (120).
+    The device clamps 46-54 to 45 and 116-119 to 120, so those are not valid inputs.
+    """
+    return temp_f in (TEMP_LO_F, TEMP_HI_F) or TEMP_MIN_F <= temp_f <= TEMP_MAX_F
 
 
 class OolerBLEDevice:
@@ -372,7 +381,11 @@ class OolerBLEDevice:
             await self._write_gatt(SETTEMP_CHAR, settemp_f.to_bytes(1, "little"))
 
     async def set_mode(self, mode: OolerMode) -> None:
-        """Set pump mode: 'Silent', 'Regular', or 'Boost'."""
+        """Set pump mode: 'Silent', 'Regular', or 'Boost'.
+
+        If the device is off, the value is cached in state and will be
+        sent to the device on the next set_power(True) call.
+        """
         if mode not in MODE_INT_TO_MODE_STATE:
             raise ValueError(
                 f"Invalid mode '{mode}'. Must be one of: {MODE_INT_TO_MODE_STATE}"
@@ -382,12 +395,21 @@ class OolerBLEDevice:
         if self._client is None:
             raise RuntimeError("Failed to connect to device")
         mode_int = MODE_INT_TO_MODE_STATE.index(mode)
-        await self._write_gatt(MODE_CHAR, mode_int.to_bytes(1, "little"))
+        if self._state.power:
+            await self._write_gatt(MODE_CHAR, mode_int.to_bytes(1, "little"))
+        else:
+            _LOGGER.debug(
+                "Device is off; mode cached and will be sent on power-on."
+            )
         _LOGGER.debug("Set mode to %s.", mode)
         self._state.mode = mode
 
     async def set_temperature(self, settemp_int: int) -> None:
-        """Set target temperature. Value should be in the current display unit."""
+        """Set target temperature. Value should be in the current display unit.
+
+        If the device is off, the value is cached in state and will be
+        sent to the device on the next set_power(True) call.
+        """
         if self._client is None:
             await self.connect()
         if self._client is None:
@@ -398,12 +420,18 @@ class OolerBLEDevice:
             if self._state.temperature_unit == "C"
             else settemp_int
         )
-        if not _MIN_TEMP_F <= settemp_f <= _MAX_TEMP_F:
+        if not _is_valid_temp_f(settemp_f):
             raise ValueError(
-                f"Temperature {settemp_int} (={settemp_f}°F) out of range "
-                f"({_MIN_TEMP_F}-{_MAX_TEMP_F}°F)"
+                f"Temperature {settemp_int} (={settemp_f}°F) out of range. "
+                f"Valid: {TEMP_LO_F} (LO), {TEMP_MIN_F}-{TEMP_MAX_F}, "
+                f"or {TEMP_HI_F} (HI)"
             )
-        await self._write_gatt(SETTEMP_CHAR, settemp_f.to_bytes(1, "little"))
+        if self._state.power:
+            await self._write_gatt(SETTEMP_CHAR, settemp_f.to_bytes(1, "little"))
+        else:
+            _LOGGER.debug(
+                "Device is off; temperature cached and will be sent on power-on."
+            )
         _LOGGER.debug(
             "Set temperature to %s (wrote %s°F to device).", settemp_int, settemp_f
         )
@@ -415,21 +443,31 @@ class OolerBLEDevice:
             await self.connect()
         if self._client is None:
             raise RuntimeError("Failed to connect to device")
-        # Turn on first else clean will not be active.
-        await self.set_power(True)
-
+        # Power on first — clean requires the device to be running.
+        if not self._state.power:
+            await self.set_power(True)
         await self._write_gatt(CLEAN_CHAR, int(clean).to_bytes(1, "little"))
         _LOGGER.debug("Set clean to %s.", clean)
         self._state.clean = clean
 
     async def set_temperature_unit(self, unit: TemperatureUnit) -> None:
-        """Set device display unit: 'C' or 'F'."""
+        """Set device display unit: 'C' or 'F'.
+
+        Unlike mode and temperature, there is no resend-on-power-on for this
+        setting, so it is only written when the device is on. If the device
+        is off, a warning is logged and the write is skipped.
+        """
         if unit not in ("C", "F"):
             raise ValueError(f"Invalid temperature unit '{unit}'. Must be 'C' or 'F'")
         if self._client is None:
             await self.connect()
         if self._client is None:
             raise RuntimeError("Failed to connect to device")
+        if not self._state.power:
+            _LOGGER.warning(
+                "Device is off; display unit write skipped (device drops writes when off)."
+            )
+            return
         unit_byte = (1 if unit == "C" else 0).to_bytes(1, "little")
         await self._write_gatt(DISPLAY_TEMPERATURE_UNIT_CHAR, unit_byte)
         _LOGGER.debug("Set temperature unit to %s.", unit)

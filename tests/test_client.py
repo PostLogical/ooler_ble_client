@@ -40,8 +40,13 @@ def _make_sender(uuid: str) -> MagicMock:
     return sender
 
 
-def _make_connected_device() -> tuple[OolerBLEDevice, MagicMock]:
-    """Create a device with a mocked connected client."""
+def _make_connected_device(
+    *, power: bool = True,
+) -> tuple[OolerBLEDevice, MagicMock]:
+    """Create a device with a mocked connected client.
+
+    Defaults to power=True since the device silently drops writes when off.
+    """
     device = OolerBLEDevice(model="OOLER-TEST")
     client = MagicMock()
     client.is_connected = True
@@ -54,7 +59,7 @@ def _make_connected_device() -> tuple[OolerBLEDevice, MagicMock]:
     device._state.temperature_unit = "F"
     device._state.mode = "Regular"
     device._state.set_temperature = 72
-    device._state.power = False
+    device._state.power = power
     return device, client
 
 
@@ -307,13 +312,27 @@ class TestInputValidation:
         device, _ = _make_connected_device()
         device._state.temperature_unit = "C"
         with pytest.raises(ValueError, match="out of range"):
-            await device.set_temperature(50)  # 50°C = 122°F, over 115
+            await device.set_temperature(50)  # 50°C = 122°F, over HI
 
     @pytest.mark.asyncio
     async def test_set_temperature_below_range(self) -> None:
         device, _ = _make_connected_device()
         with pytest.raises(ValueError, match="out of range"):
             await device.set_temperature(30)
+
+    @pytest.mark.asyncio
+    async def test_set_temperature_in_dead_zone_below(self) -> None:
+        """Values 46-54 are in a dead zone (device clamps to 45)."""
+        device, _ = _make_connected_device()
+        with pytest.raises(ValueError, match="out of range"):
+            await device.set_temperature(50)
+
+    @pytest.mark.asyncio
+    async def test_set_temperature_in_dead_zone_above(self) -> None:
+        """Values 116-119 are in a dead zone (device clamps to 120)."""
+        device, _ = _make_connected_device()
+        with pytest.raises(ValueError, match="out of range"):
+            await device.set_temperature(118)
 
 
 class TestIsConnected:
@@ -334,7 +353,7 @@ class TestIsConnected:
 class TestSetPower:
     @pytest.mark.asyncio
     async def test_set_power_on(self) -> None:
-        device, client = _make_connected_device()
+        device, client = _make_connected_device(power=False)
         await device.set_power(True)
         assert client.write_gatt_char.call_count == 3
         assert device.state.power is True
@@ -348,7 +367,7 @@ class TestSetPower:
 
     @pytest.mark.asyncio
     async def test_set_power_on_skips_resend_when_state_none(self) -> None:
-        device, client = _make_connected_device()
+        device, client = _make_connected_device(power=False)
         device._state.mode = None
         device._state.set_temperature = None
         await device.set_power(True)
@@ -356,7 +375,7 @@ class TestSetPower:
 
     @pytest.mark.asyncio
     async def test_set_power_writes_correct_bytes(self) -> None:
-        device, client = _make_connected_device()
+        device, client = _make_connected_device(power=False)
         device._state.mode = None
         device._state.set_temperature = None
         await device.set_power(True)
@@ -386,7 +405,7 @@ class TestSetPower:
 
     @pytest.mark.asyncio
     async def test_set_power_on_resends_celsius_temp(self) -> None:
-        device, client = _make_connected_device()
+        device, client = _make_connected_device(power=False)
         device._state.temperature_unit = "C"
         device._state.set_temperature = 22  # 22°C = 72°F
         await device.set_power(True)
@@ -414,6 +433,16 @@ class TestSetMode:
         device, client = _make_connected_device()
         await device.set_mode("Silent")
         client.write_gatt_char.assert_called_with(MODE_CHAR, b"\x00", True)
+
+    @pytest.mark.asyncio
+    async def test_set_mode_cached_when_off(self) -> None:
+        """Mode is cached but not written to device when off."""
+        device, client = _make_connected_device(power=False)
+        await device.set_mode("Boost")
+        # No GATT write since device is off
+        client.write_gatt_char.assert_not_called()
+        # But state is updated for resend on power-on
+        assert device.state.mode == "Boost"
 
     @pytest.mark.asyncio
     async def test_set_mode_connects_if_not_connected(self) -> None:
@@ -454,6 +483,28 @@ class TestSetTemperature:
         assert device.state.set_temperature == 22
 
     @pytest.mark.asyncio
+    async def test_set_temperature_lo(self) -> None:
+        device, client = _make_connected_device()
+        await device.set_temperature(45)
+        client.write_gatt_char.assert_called_with(SETTEMP_CHAR, b"\x2d", True)
+        assert device.state.set_temperature == 45
+
+    @pytest.mark.asyncio
+    async def test_set_temperature_hi(self) -> None:
+        device, client = _make_connected_device()
+        await device.set_temperature(120)
+        client.write_gatt_char.assert_called_with(SETTEMP_CHAR, b"\x78", True)
+        assert device.state.set_temperature == 120
+
+    @pytest.mark.asyncio
+    async def test_set_temperature_cached_when_off(self) -> None:
+        """Temperature is cached but not written to device when off."""
+        device, client = _make_connected_device(power=False)
+        await device.set_temperature(65)
+        client.write_gatt_char.assert_not_called()
+        assert device.state.set_temperature == 65
+
+    @pytest.mark.asyncio
     async def test_set_temperature_connects_if_not_connected(self) -> None:
         device = OolerBLEDevice(model="OOLER-TEST")
         device._ble_device = MagicMock()
@@ -486,7 +537,6 @@ class TestSetClean:
     @pytest.mark.asyncio
     async def test_set_clean_off(self) -> None:
         device, client = _make_connected_device()
-        device._state.power = True
         await device.set_clean(False)
         assert device.state.clean is False
 
@@ -529,6 +579,16 @@ class TestSetTemperatureUnit:
         client.write_gatt_char.assert_called_with(
             DISPLAY_TEMPERATURE_UNIT_CHAR, b"\x00", True
         )
+
+    @pytest.mark.asyncio
+    async def test_set_unit_skipped_when_off(self) -> None:
+        """Unit write is skipped when device is off (no resend-on-power-on)."""
+        device, client = _make_connected_device(power=False)
+        device._state.temperature_unit = "F"
+        await device.set_temperature_unit("C")
+        client.write_gatt_char.assert_not_called()
+        # State should NOT be updated since write was skipped
+        assert device.state.temperature_unit == "F"
 
     @pytest.mark.asyncio
     async def test_set_unit_connects_if_not_connected(self) -> None:
