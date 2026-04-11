@@ -94,12 +94,17 @@ DELTA_COOL_CHAR = "be83c9a6-462d-43b7-9528-28a87865e565"  # read; matches config
 CONFIG_WRITE_CHAR = "87c9fb8d-f243-4412-98cf-cc0c97b3d106"
 
 # -- Schedule service (b430cd72-3a7f-4720-86fd-66ae8f6f3493) --
-# Only one schedule can be active at a time. Disabled schedules are not
-# written to the device. Format partially decoded; see schedule notes.
-SCHEDULE_HEADER_CHAR = "8cb4ec90-cd94-4f69-b963-5473fbd94ec8"  # read/write; 2-byte sequence counter
-SCHEDULE_TIMES_CHAR = "8cb4ec90-cd94-4f69-b963-5473fbd94ea9"  # read/write; 140 bytes
-SCHEDULE_TEMPS_CHAR = "fa242bc0-bf85-41f7-8dbb-53ba2e8b0895"  # read/write; 70 bytes
-SCHEDULE_META_CHAR = "fa242bc0-bf85-41f7-8dbb-53ba2e8b08a3"  # read; 4-byte repeat bitmask
+# One active schedule at a time. Disabled schedules are app-side only.
+# Schedule names are app-side only — not stored on the device.
+# Times are uint16 LE minute-of-week values (Mon 00:00=0, Sun 23:59=10079).
+# Temps are 1:1 with times: 0x00=OFF, 1-120=°F, 0xFE=warm wake marker, 0xFF=unused.
+# IMPORTANT: The device byte-swaps uint16 values on GATT write — pre-swap
+# times and header bytes so the device stores the intended LE values.
+# See sleep_schedule.py for full encoding/decoding logic.
+SCHEDULE_HEADER_CHAR = "8cb4ec90-cd94-4f69-b963-5473fbd94ec8"  # read/write; uint16 LE sequence counter
+SCHEDULE_TIMES_CHAR = "8cb4ec90-cd94-4f69-b963-5473fbd94ea9"  # read/write; 70 × uint16 LE minute-of-week
+SCHEDULE_TEMPS_CHAR = "fa242bc0-bf85-41f7-8dbb-53ba2e8b0895"  # read/write; 70 × uint8 temperature
+SCHEDULE_META_CHAR = "fa242bc0-bf85-41f7-8dbb-53ba2e8b08a3"  # read-only; firmware-internal state flag
 
 # -- OTA/unknown service (4d44eb61-87dd-402c-ad4c-41928e08c8eb) --
 # Standard BLE Central Address Resolution characteristic, repurposed or vestigial.

@@ -21,6 +21,7 @@ import argparse
 import asyncio
 import json
 import os
+import struct
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -133,8 +134,90 @@ NOISY_UUIDS = {
 }
 
 
+_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+
 def char_name(uuid: str) -> str:
     return KNOWN_NAMES.get(uuid, uuid)
+
+
+def _week_min_to_str(mins: int) -> str:
+    """Convert minute-of-week to 'Day HH:MM'."""
+    day = mins // 1440
+    h, m = divmod(mins % 1440, 60)
+    d = _DAYS[day] if day < 7 else f"Day{day}"
+    return f"{d} {h:02d}:{m:02d}"
+
+
+def _temp_str(t: int) -> str:
+    if t == 0:
+        return "OFF"
+    if t == 0xFE:
+        return "WARM_WAKE"
+    return f"{t}°F"
+
+
+def decode_schedule(chars: dict) -> str | None:
+    """Decode schedule characteristics into a human-readable summary."""
+    header_info = chars.get(SCHEDULE_HEADER_CHAR, {})
+    times_info = chars.get(SCHEDULE_TIMES_CHAR, {})
+    temps_info = chars.get(SCHEDULE_TEMPS_CHAR, {})
+    meta_info = chars.get(SCHEDULE_META_CHAR, {})
+
+    times_hex = times_info.get("value")
+    temps_hex = temps_info.get("value")
+    if not times_hex or not temps_hex:
+        return None
+
+    # Parse header
+    header_hex = header_info.get("value")
+    header_val = int.from_bytes(
+        bytes.fromhex(header_hex.replace(" ", "")), "little"
+    ) if header_hex else None
+
+    # Parse meta
+    meta_hex = meta_info.get("value")
+    meta_bytes = bytes.fromhex(meta_hex.replace(" ", "")) if meta_hex else b"\x00\x00\x00\x00"
+
+    # Parse times (uint16 LE minute-of-week values)
+    times_data = bytes.fromhex(times_hex.replace(" ", ""))
+    times: list[int] = []
+    for i in range(0, len(times_data), 2):
+        val = struct.unpack_from("<H", times_data, i)[0]
+        if val == 0 and i > 0 and all(b == 0 for b in times_data[i:]):
+            break
+        times.append(val)
+
+    # Parse temps (1:1 with times)
+    temps_data = bytes.fromhex(temps_hex.replace(" ", ""))
+    temps = list(temps_data[: len(times)])
+
+    if not times or all(t == 0 for t in times):
+        return "  (no schedule)"
+
+    lines = []
+    lines.append(f"  Seq: {header_val}  Meta: {list(meta_bytes)} (byte0=0b{meta_bytes[0]:08b})")
+    lines.append(f"  Events: {len(times)}")
+
+    # Group into "nights" (sequences ending with OFF)
+    night: list[tuple[int, int]] = []
+    for i in range(len(times)):
+        night.append((times[i], temps[i]))
+        if temps[i] == 0:  # OFF marks end of a night
+            start_day = _DAYS[night[0][0] // 1440] if night[0][0] // 1440 < 7 else "?"
+            events = " → ".join(
+                f"{_week_min_to_str(t)}={_temp_str(tmp)}" for t, tmp in night
+            )
+            lines.append(f"  {start_day} night: {events}")
+            night = []
+    # Handle trailing events with no OFF (partial schedule or bedtime-only)
+    if night:
+        events = " → ".join(
+            f"{_week_min_to_str(t)}={_temp_str(tmp)}" for t, tmp in night
+        )
+        lines.append(f"  (open): {events}")
+
+    return "\n".join(lines)
 
 
 def decode_friendly(uuid: str, hex_str: str) -> str:
@@ -160,6 +243,10 @@ def decode_friendly(uuid: str, hex_str: str) -> str:
         return f"{data[0]}°F"
     if uuid == RELATIVE_HUMIDITY_CHAR:
         return f"{data[0]}%"
+    if uuid == SCHEDULE_HEADER_CHAR:
+        return f"seq={int.from_bytes(data, 'little')}"
+    if uuid == SCHEDULE_META_CHAR:
+        return f"meta={list(data)} (byte0=0b{data[0]:08b})"
     try:
         text = data.decode("utf-8")
         if text.isprintable():
@@ -297,6 +384,17 @@ def diff_snapshots(old: dict, new: dict, label: str | None = None) -> None:
 
     if changes == 0:
         print("  (no changes)")
+
+    # If any schedule char changed, show decoded before/after
+    sched_uuids = {SCHEDULE_HEADER_CHAR, SCHEDULE_TIMES_CHAR, SCHEDULE_TEMPS_CHAR, SCHEDULE_META_CHAR}
+    if any(old_chars.get(u, {}).get("value") != new_chars.get(u, {}).get("value") for u in sched_uuids):
+        old_sched = decode_schedule(old_chars)
+        new_sched = decode_schedule(new_chars)
+        if old_sched or new_sched:
+            print("\n  SCHEDULE BEFORE:")
+            print(old_sched or "  (none)")
+            print("\n  SCHEDULE AFTER:")
+            print(new_sched or "  (none)")
     print()
 
 
@@ -315,6 +413,13 @@ def print_snapshot(snapshot: dict) -> None:
             f_str = f"  => {friendly}" if friendly else ""
             print(f"  {name:25s} {val}{f_str}")
     print()
+
+    # Decoded schedule view
+    sched = decode_schedule(snapshot["characteristics"])
+    if sched:
+        print("SCHEDULE (decoded):")
+        print(sched)
+        print()
 
 
 async def main() -> None:

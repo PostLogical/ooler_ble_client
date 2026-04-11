@@ -18,6 +18,16 @@ from ooler_ble_client.const import (
     WATER_LEVEL_CHAR,
     CLEAN_CHAR,
     DISPLAY_TEMPERATURE_UNIT_CHAR,
+    SCHEDULE_HEADER_CHAR,
+    SCHEDULE_TIMES_CHAR,
+    SCHEDULE_TEMPS_CHAR,
+)
+from ooler_ble_client.sleep_schedule import (
+    SleepScheduleEvent,
+    SleepScheduleNight,
+    WarmWake,
+    _TIMES_LENGTH,
+    _TEMPS_LENGTH,
 )
 
 # Standard GATT read responses for a fully populated state
@@ -61,6 +71,12 @@ def _make_connected_device(
     device._state.set_temperature = 72
     device._state.power = power
     return device, client
+
+
+# Schedule reads (empty schedule)
+_SCHEDULE_HEADER = b"\x00\x00"
+_SCHEDULE_TIMES = bytes(_TIMES_LENGTH)
+_SCHEDULE_TEMPS = bytes([0xFF] * _TEMPS_LENGTH)
 
 
 def _make_mock_client(reads: list[bytes] | None = None) -> MagicMock:
@@ -1678,3 +1694,397 @@ class TestConcurrentPollAndNotification:
         await device.async_poll()
         assert device.state is not None
         assert notification_count == 6  # One per read
+
+
+# -- Sleep schedule tests --
+
+
+# Simple schedule: 10pm–6am at 68°F, all 7 days
+_SIMPLE_SCHED_TIMES = bytes.fromhex(
+    "68 01 28 05 08 07 c8 0a a8 0c 68 10 48 12 08 16"
+    " e8 17 a8 1b 88 1d 48 21 28 23 e8 26"
+    + " 00" * (140 - 28)
+)
+_SIMPLE_SCHED_TEMPS = bytes.fromhex(
+    "00 44 00 44 00 44 00 44 00 44 00 44 00 44"
+    + " ff" * (70 - 14)
+)
+
+
+class TestSleepScheduleProperties:
+    def test_initial_state(self) -> None:
+        device = OolerBLEDevice(model="OOLER-TEST")
+        assert device.sleep_schedule is None
+        assert device.sleep_schedule_events == []
+
+    def test_separate_instances(self) -> None:
+        d1 = OolerBLEDevice(model="OOLER-1")
+        d2 = OolerBLEDevice(model="OOLER-2")
+        d1._sleep_schedule_events.append(
+            SleepScheduleEvent(minute_of_week=0, temp_f=68)
+        )
+        assert d2._sleep_schedule_events == []
+
+
+class TestSleepScheduleInitialState:
+    def test_schedule_none_before_read(self) -> None:
+        """Sleep schedule is None before first read."""
+        device = OolerBLEDevice(model="OOLER-TEST")
+        assert device.sleep_schedule is None
+        assert device.sleep_schedule_events == []
+
+    @pytest.mark.asyncio
+    async def test_schedule_not_read_on_connect(self) -> None:
+        """Sleep schedule is NOT read automatically on connect (lazy read)."""
+        mock_client = _make_mock_client()
+        device = OolerBLEDevice(model="OOLER-TEST")
+        device.set_ble_device(MagicMock())
+
+        with _patch_establish(mock_client):
+            await device.connect()
+
+        assert device.sleep_schedule is None  # not yet read
+
+
+class TestReadSleepSchedule:
+    @pytest.mark.asyncio
+    async def test_read_sleep_schedule(self) -> None:
+        device, client = _make_connected_device()
+        client.read_gatt_char = AsyncMock(
+            side_effect=[b"\x10\x00", _SIMPLE_SCHED_TIMES, _SIMPLE_SCHED_TEMPS]
+        )
+        schedule = await device.read_sleep_schedule()
+        assert schedule.seq == 16
+        assert len(schedule.nights) == 7
+        assert client.read_gatt_char.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_read_empty_schedule(self) -> None:
+        device, client = _make_connected_device()
+        client.read_gatt_char = AsyncMock(
+            side_effect=[_SCHEDULE_HEADER, _SCHEDULE_TIMES, _SCHEDULE_TEMPS]
+        )
+        schedule = await device.read_sleep_schedule()
+        assert schedule.nights == []
+
+    @pytest.mark.asyncio
+    async def test_read_sleep_schedule_connects_if_needed(self) -> None:
+        reads = (
+            [_TEMP_UNIT_F]
+            + _GATT_READS_F
+            # read_sleep_schedule call
+            + [_SCHEDULE_HEADER, _SIMPLE_SCHED_TIMES, _SIMPLE_SCHED_TEMPS]
+        )
+        mock_client = _make_mock_client(reads)
+        device = OolerBLEDevice(model="OOLER-TEST")
+        device.set_ble_device(MagicMock())
+
+        with _patch_establish(mock_client):
+            schedule = await device.read_sleep_schedule()
+
+        assert schedule is not None
+
+
+class TestSetSleepSchedule:
+    @pytest.mark.asyncio
+    async def test_set_sleep_schedule_events(self) -> None:
+        device, client = _make_connected_device()
+        device._sleep_schedule_seq = 10
+
+        events = [
+            SleepScheduleEvent(minute_of_week=1320, temp_f=68),
+            SleepScheduleEvent(minute_of_week=1800, temp_f=0),
+        ]
+        await device.set_sleep_schedule_events(events)
+
+        # Write order: times, temps, header (header last as commit)
+        assert client.write_gatt_char.call_count == 3
+        times_call = client.write_gatt_char.call_args_list[0]
+        assert times_call[0][0] == SCHEDULE_TIMES_CHAR
+        temps_call = client.write_gatt_char.call_args_list[1]
+        assert temps_call[0][0] == SCHEDULE_TEMPS_CHAR
+        # Header is byte-swapped for the device: seq 11 LE = 0b 00, swapped = 00 0b
+        header_call = client.write_gatt_char.call_args_list[2]
+        assert header_call[0][0] == SCHEDULE_HEADER_CHAR
+        assert header_call[0][1] == b"\x00\x0b"  # seq 11 byte-swapped
+        # Cache updated
+        assert device._sleep_schedule_seq == 11
+        assert len(device.sleep_schedule_events) == 2
+        assert device.sleep_schedule is not None
+
+    @pytest.mark.asyncio
+    async def test_set_sleep_schedule_structured(self) -> None:
+        device, client = _make_connected_device()
+        device._sleep_schedule_seq = 5
+
+        from datetime import time
+
+        nights = [
+            SleepScheduleNight(
+                day=0,
+                temps=[(time(22, 0), 68)],
+                off_time=time(6, 0),
+            )
+        ]
+        await device.set_sleep_schedule(nights)
+
+        assert client.write_gatt_char.call_count == 3
+        assert device._sleep_schedule_seq == 6
+        assert device.sleep_schedule is not None
+        assert len(device.sleep_schedule.nights) == 1
+
+    @pytest.mark.asyncio
+    async def test_set_sleep_schedule_connects_if_needed(self) -> None:
+        mock_client = _make_mock_client()
+        device = OolerBLEDevice(model="OOLER-TEST")
+        device.set_ble_device(MagicMock())
+
+        with _patch_establish(mock_client):
+            await device.set_sleep_schedule_events([])
+
+        assert device.is_connected
+
+
+class TestSetCleanAutosPowerOn:
+    @pytest.mark.asyncio
+    async def test_set_clean_powers_on_device(self) -> None:
+        """Setting clean when device is off should auto-power-on first."""
+        device, client = _make_connected_device(power=False)
+        await device.set_clean(True)
+        # First write is power on, second is clean
+        assert client.write_gatt_char.call_count >= 2
+        assert device.state.power is True
+        assert device.state.clean is True
+
+
+class TestSleepScheduleConnectGuards:
+    @pytest.mark.asyncio
+    async def test_read_schedule_raises_if_connect_fails(self) -> None:
+        device = OolerBLEDevice(model="OOLER-TEST")
+        device.set_ble_device(MagicMock())
+
+        mock_client = _make_mock_client()
+        # Simulate connect succeeding but then client becomes None
+        async def fake_connect() -> None:
+            device._client = None  # simulate failed connect
+
+        device.connect = fake_connect  # type: ignore[assignment]
+        with pytest.raises(RuntimeError, match="Failed to connect"):
+            await device.read_sleep_schedule()
+
+    @pytest.mark.asyncio
+    async def test_set_schedule_events_raises_if_connect_fails(self) -> None:
+        device = OolerBLEDevice(model="OOLER-TEST")
+        device.set_ble_device(MagicMock())
+
+        async def fake_connect() -> None:
+            device._client = None
+
+        device.connect = fake_connect  # type: ignore[assignment]
+        with pytest.raises(RuntimeError, match="Failed to connect"):
+            await device.set_sleep_schedule_events([])
+
+
+class TestClearSleepSchedule:
+    @pytest.mark.asyncio
+    async def test_clear_sleep_schedule(self) -> None:
+        device, client = _make_connected_device()
+        device._sleep_schedule_seq = 5
+
+        await device.clear_sleep_schedule()
+
+        assert client.write_gatt_char.call_count == 3
+        # Write order: times, temps, header
+        # Times should be all zeros (byte-swapped zeros are still zeros)
+        times_call = client.write_gatt_char.call_args_list[0]
+        assert times_call[0][0] == SCHEDULE_TIMES_CHAR
+        assert times_call[0][1] == bytes(_TIMES_LENGTH)
+        # Temps should be all 0xFF
+        temps_call = client.write_gatt_char.call_args_list[1]
+        assert temps_call[0][0] == SCHEDULE_TEMPS_CHAR
+        assert temps_call[0][1] == bytes([0xFF] * _TEMPS_LENGTH)
+        assert device.sleep_schedule_events == []
+        assert device._sleep_schedule_seq == 6
+
+
+class TestSyncClock:
+    @pytest.mark.asyncio
+    async def test_sync_clock_default(self) -> None:
+        device, client = _make_connected_device()
+        await device.sync_clock()
+        assert client.write_gatt_char.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_sync_clock_specific_time(self) -> None:
+        from datetime import datetime, timezone, timedelta
+
+        device, client = _make_connected_device()
+        # EDT: UTC-4 (UTC-5 base + 1h DST)
+        edt = timezone(timedelta(hours=-4))
+        now = datetime(2026, 4, 11, 14, 30, 0, tzinfo=edt)
+        # Manually set dst() — use a proper tzinfo for this
+        import struct
+
+        await device.sync_clock(now)
+
+        assert client.write_gatt_char.call_count == 2
+        # Check current time bytes
+        ct_call = client.write_gatt_char.call_args_list[0]
+        ct_data = ct_call[0][1]
+        year = struct.unpack_from("<H", ct_data, 0)[0]
+        assert year == 2026
+        assert ct_data[2] == 4   # month
+        assert ct_data[3] == 11  # day
+        assert ct_data[4] == 14  # hour
+        assert ct_data[5] == 30  # minute
+        assert ct_data[6] == 0   # second
+        assert ct_data[7] == 6   # Saturday = 6 in isoweekday
+
+    @pytest.mark.asyncio
+    async def test_sync_clock_fixed_offset_dst_unknown(self) -> None:
+        """Fixed-offset timezone can't report DST — should be 0xFF (unknown)."""
+        from datetime import datetime, timezone, timedelta
+
+        device, client = _make_connected_device()
+        # Fixed UTC-5 — dst() returns None
+        tz = timezone(timedelta(hours=-5))
+        now = datetime(2026, 1, 15, 10, 0, 0, tzinfo=tz)
+
+        await device.sync_clock(now)
+
+        lt_call = client.write_gatt_char.call_args_list[1]
+        lt_data = lt_call[0][1]
+        import struct
+        tz_offset, dst = struct.unpack("bB", lt_data)
+        assert tz_offset == -20  # -5 hours = -20 * 15min
+        assert dst == 255  # unknown (fixed-offset can't determine DST)
+
+    @pytest.mark.asyncio
+    async def test_sync_clock_dst_zero_when_standard_time(self) -> None:
+        """IANA timezone in standard time should report DST=0."""
+        from datetime import datetime, timedelta, tzinfo
+
+        class EST(tzinfo):
+            def utcoffset(self, dt: datetime | None) -> timedelta:
+                return timedelta(hours=-5)
+            def dst(self, dt: datetime | None) -> timedelta:
+                return timedelta(0)  # standard time, DST not active
+            def tzname(self, dt: datetime | None) -> str:
+                return "EST"
+
+        device, client = _make_connected_device()
+        now = datetime(2026, 1, 15, 10, 0, 0, tzinfo=EST())
+        await device.sync_clock(now)
+
+        import struct
+        lt_call = client.write_gatt_char.call_args_list[1]
+        lt_data = lt_call[0][1]
+        tz_offset, dst = struct.unpack("bB", lt_data)
+        assert tz_offset == -20
+        assert dst == 0  # standard time confirmed
+
+    @pytest.mark.asyncio
+    async def test_sync_clock_with_dst(self) -> None:
+        from datetime import datetime, timedelta, tzinfo
+
+        # Create a tzinfo that reports DST active
+        class EDT(tzinfo):
+            def utcoffset(self, dt: datetime | None) -> timedelta:
+                return timedelta(hours=-4)
+            def dst(self, dt: datetime | None) -> timedelta:
+                return timedelta(hours=1)
+            def tzname(self, dt: datetime | None) -> str:
+                return "EDT"
+
+        device, client = _make_connected_device()
+        now = datetime(2026, 7, 15, 10, 0, 0, tzinfo=EDT())
+        await device.sync_clock(now)
+
+        import struct
+        lt_call = client.write_gatt_char.call_args_list[1]
+        lt_data = lt_call[0][1]
+        tz_offset, dst_byte = struct.unpack("bB", lt_data)
+        assert tz_offset == -20  # -5h base = -20 * 15min
+        assert dst_byte == 4     # +1h DST
+
+    @pytest.mark.asyncio
+    async def test_sync_clock_naive_datetime_raises(self) -> None:
+        from datetime import datetime
+
+        device, _ = _make_connected_device()
+        with pytest.raises(ValueError, match="timezone-aware"):
+            await device.sync_clock(datetime(2026, 4, 11, 14, 0, 0))
+
+    @pytest.mark.asyncio
+    async def test_sync_clock_connects_if_needed(self) -> None:
+        from datetime import datetime, timezone, timedelta
+
+        mock_client = _make_mock_client()
+        device = OolerBLEDevice(model="OOLER-TEST")
+        device.set_ble_device(MagicMock())
+
+        tz = timezone(timedelta(hours=-5))
+        now = datetime(2026, 1, 15, 10, 0, 0, tzinfo=tz)
+        with _patch_establish(mock_client):
+            await device.sync_clock(now)
+
+        assert device.is_connected
+
+    @pytest.mark.asyncio
+    async def test_sync_clock_broken_tzinfo_raises(self) -> None:
+        from datetime import datetime, timedelta, tzinfo as TZInfo
+
+        class BrokenTZ(TZInfo):
+            def utcoffset(self, dt: datetime | None) -> None:
+                return None
+            def dst(self, dt: datetime | None) -> None:
+                return None
+
+        device, _ = _make_connected_device()
+        with pytest.raises(ValueError, match="UTC offset"):
+            await device.sync_clock(datetime(2026, 4, 11, 14, 0, 0, tzinfo=BrokenTZ()))
+
+    def test_local_now_with_tz_env(self) -> None:
+        from ooler_ble_client.client import _local_now
+
+        with patch.dict("os.environ", {"TZ": "America/New_York"}):
+            now = _local_now()
+        assert now.tzinfo is not None
+        # Should have DST info from zoneinfo
+        assert now.dst() is not None
+
+    def test_local_now_from_etc_localtime(self) -> None:
+        from ooler_ble_client.client import _local_now
+
+        with patch.dict("os.environ", {}, clear=True):
+            # Remove TZ so it falls through to /etc/localtime
+            now = _local_now()
+        assert now.tzinfo is not None
+
+    def test_local_now_readlink_oserror(self) -> None:
+        """Falls back when /etc/localtime can't be read."""
+        from ooler_ble_client.client import _local_now
+
+        with patch.dict("os.environ", {}, clear=True), \
+             patch("os.readlink", side_effect=OSError("no symlink")):
+            now = _local_now()
+        assert now.tzinfo is not None
+
+    def test_local_now_fallback_on_error(self) -> None:
+        from ooler_ble_client.client import _local_now
+
+        with patch.dict("os.environ", {"TZ": "Not/A/Real/Timezone"}):
+            now = _local_now()
+        # Should fall back to fixed-offset
+        assert now.tzinfo is not None
+
+    @pytest.mark.asyncio
+    async def test_sync_clock_raises_if_connect_fails(self) -> None:
+        device = OolerBLEDevice(model="OOLER-TEST")
+
+        async def fake_connect() -> None:
+            device._client = None
+
+        device.connect = fake_connect  # type: ignore[assignment]
+        with pytest.raises(RuntimeError, match="Failed to connect"):
+            await device.sync_clock()

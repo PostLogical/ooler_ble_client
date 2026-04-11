@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import struct
 from collections.abc import Callable, Coroutine
+from datetime import datetime, timezone
 from typing import Any
 
 from bleak.backends.device import BLEDevice
@@ -24,13 +26,40 @@ from .const import (
     WATER_LEVEL_CHAR,
     CLEAN_CHAR,
     DISPLAY_TEMPERATURE_UNIT_CHAR,
+    SCHEDULE_HEADER_CHAR,
+    SCHEDULE_TIMES_CHAR,
+    SCHEDULE_TEMPS_CHAR,
+    CURRENT_TIME_CHAR,
+    LOCAL_TIME_INFO_CHAR,
     TEMP_LO_F,
     TEMP_MIN_F,
     TEMP_MAX_F,
     TEMP_HI_F,
 )
+from .sleep_schedule import (
+    OolerSleepSchedule,
+    SleepScheduleEvent,
+    SleepScheduleNight,
+    decode_sleep_schedule_events,
+    encode_sleep_schedule_events,
+    events_to_sleep_schedule,
+    sleep_schedule_to_events,
+)
 
 _RECONNECT_BACKOFF_SECONDS = 0.5
+
+
+def _byteswap_uint16s(data: bytes) -> bytes:
+    """Swap each pair of bytes in a buffer.
+
+    The Ooler firmware byte-swaps uint16 values on GATT writes to the
+    schedule service.  To compensate, we pre-swap so the device stores
+    the intended little-endian values.
+    """
+    buf = bytearray(data)
+    for i in range(0, len(buf) - 1, 2):
+        buf[i], buf[i + 1] = buf[i + 1], buf[i]
+    return bytes(buf)
 
 
 def _f_to_c(f: int) -> int:
@@ -65,6 +94,9 @@ class OolerBLEDevice:
         self._callbacks: list[Callable[[OolerBLEState], None]] = []
         self._ble_device: BLEDevice | None = None
         self._expected_disconnect = False
+        self._sleep_schedule: OolerSleepSchedule | None = None
+        self._sleep_schedule_events: list[SleepScheduleEvent] = []
+        self._sleep_schedule_seq: int = 0
 
     def set_ble_device(self, ble_device: BLEDevice) -> None:
         """Set the BLE Device."""
@@ -86,6 +118,16 @@ class OolerBLEDevice:
     def state(self) -> OolerBLEState:
         """Return the state."""
         return self._state
+
+    @property
+    def sleep_schedule(self) -> OolerSleepSchedule | None:
+        """Return the cached sleep schedule, or None if not yet read."""
+        return self._sleep_schedule
+
+    @property
+    def sleep_schedule_events(self) -> list[SleepScheduleEvent]:
+        """Return the cached sleep schedule as a flat event list."""
+        return self._sleep_schedule_events
 
     async def connect(self) -> None:
         await self._ensure_connected()
@@ -474,6 +516,174 @@ class OolerBLEDevice:
         _LOGGER.debug("Set temperature unit to %s.", unit)
         self._state.temperature_unit = unit
 
+    async def _read_sleep_schedule_chars(
+        self, client: BleakClientWithServiceCache
+    ) -> None:
+        """Read schedule characteristics and cache the parsed result."""
+        header_bytes = await client.read_gatt_char(SCHEDULE_HEADER_CHAR)
+        times_bytes = await client.read_gatt_char(SCHEDULE_TIMES_CHAR)
+        temps_bytes = await client.read_gatt_char(SCHEDULE_TEMPS_CHAR)
+
+        self._sleep_schedule_seq = int.from_bytes(header_bytes, "little")
+        self._sleep_schedule_events = decode_sleep_schedule_events(
+            times_bytes, temps_bytes
+        )
+        self._sleep_schedule = events_to_sleep_schedule(
+            self._sleep_schedule_events, self._sleep_schedule_seq
+        )
+        _LOGGER.debug(
+            "%s: Sleep schedule read (%d events, seq=%d)",
+            self._model_id,
+            len(self._sleep_schedule_events),
+            self._sleep_schedule_seq,
+        )
+
+    async def read_sleep_schedule(self) -> OolerSleepSchedule:
+        """Read the sleep schedule from the device.
+
+        This re-reads the schedule characteristics and updates the cache.
+        """
+        if self._client is None:
+            await self.connect()
+        client = self._client
+        if client is None:
+            raise RuntimeError("Failed to connect to device")
+
+        async def _read() -> None:
+            await self._read_sleep_schedule_chars(client)
+
+        await self._retry_on_stale(_read)
+        assert self._sleep_schedule is not None
+        return self._sleep_schedule
+
+    async def set_sleep_schedule(
+        self, nights: list[SleepScheduleNight]
+    ) -> None:
+        """Write a structured sleep schedule to the device.
+
+        Encodes the nights into wire format and writes to the device.
+        Schedules with per-night variation (different warm wake settings,
+        different temperature zones per night) work correctly with the
+        device but may not display or edit correctly in the Ooler app.
+        """
+        schedule = OolerSleepSchedule(nights=nights, seq=self._sleep_schedule_seq)
+        events = sleep_schedule_to_events(schedule)
+        await self.set_sleep_schedule_events(events)
+
+    async def set_sleep_schedule_events(
+        self, events: list[SleepScheduleEvent]
+    ) -> None:
+        """Write a flat event list to the device as the sleep schedule."""
+        if self._client is None:
+            await self.connect()
+        if self._client is None:
+            raise RuntimeError("Failed to connect to device")
+
+        times_bytes, temps_bytes = encode_sleep_schedule_events(events)
+        new_seq = self._sleep_schedule_seq + 1
+        # The device byte-swaps uint16 values on write, so we pre-swap
+        # times (array of uint16) and the header (single uint16).
+        # Temps are single bytes and don't need swapping.
+        header_wire = _byteswap_uint16s(new_seq.to_bytes(2, "little"))
+        times_wire = _byteswap_uint16s(times_bytes)
+
+        await self._write_gatt(SCHEDULE_TIMES_CHAR, times_wire)
+        await self._write_gatt(SCHEDULE_TEMPS_CHAR, temps_bytes)
+        await self._write_gatt(SCHEDULE_HEADER_CHAR, header_wire)
+
+        self._sleep_schedule_seq = new_seq
+        self._sleep_schedule_events = events
+        self._sleep_schedule = events_to_sleep_schedule(events, new_seq)
+        _LOGGER.debug(
+            "%s: Sleep schedule written (%d events, seq=%d)",
+            self._model_id,
+            len(events),
+            new_seq,
+        )
+
+    async def clear_sleep_schedule(self) -> None:
+        """Clear the sleep schedule on the device."""
+        await self.set_sleep_schedule_events([])
+
+    async def sync_clock(self, now: datetime | None = None) -> None:
+        """Sync the device clock to the current time.
+
+        The Ooler has an internal clock used for schedule execution.  The
+        official app sets this clock on every connection.  This method
+        writes the standard BLE Current Time and Local Time Info
+        characteristics so the device stays in sync.
+
+        For correct DST handling, pass a datetime with a ``zoneinfo``
+        timezone (e.g. ``datetime.now(ZoneInfo("America/New_York"))``).
+        In Home Assistant, use ``ZoneInfo(hass.config.time_zone)``.
+
+        If *now* is omitted, the method uses the system's IANA timezone
+        via ``zoneinfo`` when available, falling back to a fixed-offset
+        timezone with DST marked as unknown.
+        """
+        if self._client is None:
+            await self.connect()
+        if self._client is None:
+            raise RuntimeError("Failed to connect to device")
+
+        if now is None:
+            now = _local_now()
+        if now.tzinfo is None:
+            raise ValueError("datetime must be timezone-aware")
+
+        # BLE Current Time characteristic (org.bluetooth.characteristic.current_time)
+        # 10 bytes: year(u16 LE), month, day, hour, min, sec, dow(1=Mon), frac256, adjust
+        dow = now.isoweekday()  # 1=Mon, 7=Sun (matches BLE spec)
+        current_time = struct.pack(
+            "<HBBBBBBB",
+            now.year,
+            now.month,
+            now.day,
+            now.hour,
+            now.minute,
+            now.second,
+            dow,
+            0,  # fractions (1/256s)
+        ) + b"\x01"  # adjust reason: manual time update
+
+        # BLE Local Time Info (org.bluetooth.characteristic.local_time_information)
+        # 2 bytes: tz_offset (int8, units of 15 min), dst_offset (uint8)
+        utc_offset = now.utcoffset()
+        if utc_offset is None:
+            raise ValueError("datetime must have a UTC offset")
+        total_minutes = int(utc_offset.total_seconds() / 60)
+
+        # DST: the BLE spec wants the base timezone and DST component
+        # separately.  A proper IANA timezone (via zoneinfo) reports DST
+        # correctly through .dst().  Fixed-offset timezones return None,
+        # in which case we mark DST as unknown (0xFF per BLE spec).
+        dst_offset = now.dst()
+        if dst_offset is not None:
+            dst_minutes = int(dst_offset.total_seconds() / 60)
+            tz_minutes = total_minutes - dst_minutes
+            # BLE DST encoding: 0=standard, 4=+1h, 8=+2h, 12=+0.5h, 255=unknown
+            _DST_MAP = {0: 0, 30: 12, 60: 4, 120: 8}
+            dst_byte = _DST_MAP.get(dst_minutes, 255)
+        else:
+            # Can't determine DST — use total offset and mark unknown
+            tz_minutes = total_minutes
+            dst_byte = 255
+
+        tz_offset_15 = tz_minutes // 15  # signed int8
+        local_time_info = struct.pack("bB", tz_offset_15, dst_byte)
+
+        await self._write_gatt(CURRENT_TIME_CHAR, current_time)
+        await self._write_gatt(LOCAL_TIME_INFO_CHAR, local_time_info)
+
+        _LOGGER.debug(
+            "%s: Clock synced to %s (UTC%+.1f, DST=%d)",
+            self._model_id,
+            now.strftime("%Y-%m-%d %H:%M:%S"),
+            total_minutes / 60,
+            dst_byte,
+        )
+
+
     def _disconnected_callback(self, client: BleakClientWithServiceCache | None) -> None:
         """Disconnected callback."""
         # Clear client immediately so is_connected returns False,
@@ -505,3 +715,31 @@ class OolerBLEDevice:
                             char,
                         )
                 await client.disconnect()
+
+
+def _local_now() -> datetime:
+    """Get the current local time with the best available timezone info.
+
+    Prefers ``zoneinfo`` for proper DST detection.  Falls back to a
+    fixed-offset timezone (DST will be marked unknown).
+    """
+    try:
+        import os
+
+        from zoneinfo import ZoneInfo
+
+        # Try TZ environment variable first, then /etc/localtime symlink
+        tz_name = os.environ.get("TZ")
+        if not tz_name:
+            try:
+                link = os.readlink("/etc/localtime")
+                if "zoneinfo/" in link:
+                    tz_name = link.split("zoneinfo/", 1)[1]
+            except OSError:
+                pass
+        if tz_name:
+            return datetime.now(ZoneInfo(tz_name))
+    except Exception:
+        pass
+    # Fallback: fixed-offset timezone (DST unknown)
+    return datetime.now(timezone.utc).astimezone()
