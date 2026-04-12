@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.11.0
+
+### Added
+- **Notification-staleness watchdog** -- background task that forces a reconnect when the notification stream has been silent for longer than 15 minutes while the device is powered. Addresses silent 37-249 minute notify stalls observed on ESPHome BLE proxies where reads kept succeeding but the subscription state had been lost during a proxy-internal reconnect.
+- **Connection-event channel** -- new `register_connection_event_callback()` API delivering `ConnectionEvent` instances on connect, unexpected disconnect, notify stall, and forced reconnect. Independent of the existing state callback.
+  - `ConnectionEventType` -- enum: `CONNECTED`, `DISCONNECTED`, `NOTIFY_STALL`, `FORCED_RECONNECT`
+  - `ConnectionEvent` -- frozen dataclass with `type`, `timestamp` (monotonic), and `detail` payload
+  - `NOTIFY_STALL` detail includes `stall_duration_seconds`
+  - `FORCED_RECONNECT` detail includes `trigger` (`"notify_stall"`, `"poll_failure"`, or `"write_failure"`)
+- **Flap suppression** -- `is_connected` now returns `True` throughout a forced-reconnect window so consumers (e.g. the Home Assistant coordinator) do not race the library's reconnect with their own. If the forced reconnect fails, the flag clears and the normal unexpected-disconnect path takes over.
+- **"Bluetooth is already shutdown" backoff** -- `establish_connection` is wrapped with an outer retry loop (3 attempts, 20s backoff) that recognises the specific `BleakError` substring and spans the ~15s proxy blip instead of burning 5 inner attempts in ~2 seconds.
+- 26 new tests covering watchdog behavior, event channel, flap suppression, and shutdown backoff (373 total)
+
+### Changed
+- `decode_sleep_schedule_events()` signature widened to `bytes | bytearray` to match what `BleakClient.read_gatt_char` actually returns (mypy `--strict` now clean)
+
 ## 0.10.0
 
 ### Added

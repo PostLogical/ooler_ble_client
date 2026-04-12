@@ -1,5 +1,12 @@
 from .client import OolerBLEDevice
-from .models import OolerBLEState, OolerConnectionError, OolerMode, TemperatureUnit
+from .models import (
+    ConnectionEvent,
+    ConnectionEventType,
+    OolerBLEState,
+    OolerConnectionError,
+    OolerMode,
+    TemperatureUnit,
+)
 from .sleep_schedule import (
     OolerSleepSchedule,
     SleepScheduleEvent,
@@ -9,6 +16,8 @@ from .sleep_schedule import (
 )
 
 __all__ = [
+    "ConnectionEvent",
+    "ConnectionEventType",
     "OolerBLEDevice",
     "OolerBLEState",
     "OolerConnectionError",

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import struct
+import time
 from collections.abc import Callable, Coroutine
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, ClassVar
 
 from bleak.backends.device import BLEDevice
 from bleak.backends.characteristic import BleakGATTCharacteristic
@@ -15,7 +16,14 @@ from bleak_retry_connector import (
     establish_connection,
 )
 
-from .models import OolerBLEState, OolerConnectionError, OolerMode, TemperatureUnit
+from .models import (
+    ConnectionEvent,
+    ConnectionEventType,
+    OolerBLEState,
+    OolerConnectionError,
+    OolerMode,
+    TemperatureUnit,
+)
 from .const import (
     _LOGGER,
     MODE_INT_TO_MODE_STATE,
@@ -35,6 +43,11 @@ from .const import (
     TEMP_MIN_F,
     TEMP_MAX_F,
     TEMP_HI_F,
+    _NOTIFY_STALL_TIMEOUT_SECONDS,
+    _WATCHDOG_TICK_SECONDS,
+    _WATCHDOG_RECONNECT_COOLDOWN_SECONDS,
+    _SHUTDOWN_ERROR_BACKOFF_SECONDS,
+    _SHUTDOWN_ERROR_MAX_ATTEMPTS,
 )
 from .sleep_schedule import (
     OolerSleepSchedule,
@@ -85,6 +98,11 @@ def _is_valid_temp_f(temp_f: int) -> bool:
 
 class OolerBLEDevice:
 
+    # Class-level default so the test suite can disable the background
+    # watchdog task without touching every test that calls connect().
+    # Tests re-enable it per-instance when they exercise watchdog behavior.
+    _watchdog_enabled_default: ClassVar[bool] = True
+
     def __init__(self, model: str) -> None:
         """Initialize the OolerBLEDevice."""
         self._model_id = model
@@ -92,11 +110,22 @@ class OolerBLEDevice:
         self._connect_lock = asyncio.Lock()
         self._client: BleakClientWithServiceCache | None = None
         self._callbacks: list[Callable[[OolerBLEState], None]] = []
+        self._connection_event_callbacks: list[
+            Callable[[ConnectionEvent], None]
+        ] = []
         self._ble_device: BLEDevice | None = None
         self._expected_disconnect = False
         self._sleep_schedule: OolerSleepSchedule | None = None
         self._sleep_schedule_events: list[SleepScheduleEvent] = []
         self._sleep_schedule_seq: int = 0
+        self._last_notification_monotonic: float | None = None
+        self._watchdog_task: asyncio.Task[None] | None = None
+        self._watchdog_enabled: bool = type(self)._watchdog_enabled_default
+        self._force_reconnecting: bool = False
+        self._force_reconnect_cooldown_until: float = 0.0
+        # Indirection so tests can inject a fake monotonic clock without
+        # globally patching time.monotonic.
+        self._monotonic: Callable[[], float] = time.monotonic
 
     def set_ble_device(self, ble_device: BLEDevice) -> None:
         """Set the BLE Device."""
@@ -104,7 +133,17 @@ class OolerBLEDevice:
 
     @property
     def is_connected(self) -> bool:
-        """Return whether the device is connected."""
+        """Return whether the device is connected.
+
+        During a forced reconnect (library-internal), this continues to
+        return True so downstream consumers (e.g. the HA coordinator)
+        don't flap entities unavailable while the library heals the
+        connection. If the forced reconnect fails, the flag is cleared
+        and the normal unexpected-disconnect path fires a
+        ``DISCONNECTED`` connection event.
+        """
+        if self._force_reconnecting:
+            return True
         return self._client is not None and self._client.is_connected
 
     @property
@@ -158,32 +197,75 @@ class OolerBLEDevice:
         self._callbacks.append(callback)
         return unregister_callback
 
+    def register_connection_event_callback(
+        self, callback: Callable[[ConnectionEvent], None]
+    ) -> Callable[[], None]:
+        """Register a callback invoked on connectivity events.
+
+        Delivers :class:`ConnectionEvent` instances when the device
+        connects, disconnects unexpectedly, the notify-staleness
+        watchdog trips, or a forced reconnect is initiated. The event
+        channel is independent of the state callback registered via
+        :meth:`register_callback`.
+
+        Returns a zero-arg function that unregisters the callback.
+        Multiple callbacks are supported and are invoked with per-
+        callback exception isolation.
+        """
+
+        def unregister() -> None:
+            try:
+                self._connection_event_callbacks.remove(callback)
+            except ValueError:
+                pass
+
+        self._connection_event_callbacks.append(callback)
+        return unregister
+
+    def _fire_connection_event(
+        self,
+        event_type: ConnectionEventType,
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        """Build and dispatch a :class:`ConnectionEvent` to subscribers."""
+        if not self._connection_event_callbacks:
+            return
+        event = ConnectionEvent(
+            type=event_type,
+            timestamp=self._monotonic(),
+            detail=detail,
+        )
+        for callback in list(self._connection_event_callbacks):
+            try:
+                callback(event)
+            except Exception:
+                _LOGGER.warning(
+                    "%s: Connection-event callback raised, ignoring",
+                    self._model_id,
+                    exc_info=True,
+                )
+
     async def _ensure_connected(self) -> None:
         """Ensure connection to device is established."""
+        # Don't treat ``self._force_reconnecting`` as connected: the
+        # forced-reconnect path itself calls _ensure_connected and must
+        # bypass the is_connected shortcut.
         if self._connect_lock.locked():
             _LOGGER.debug(
                 "%s: Connection already in progress, waiting for it to complete",
                 self._model_id,
             )
-        if self.is_connected:
+        if self._client is not None and self._client.is_connected:
             return
         async with self._connect_lock:
             # Check again while holding the lock
-            if self.is_connected:
+            if self._client is not None and self._client.is_connected:
                 return
             ble_device = self._ble_device
             if ble_device is None:
                 raise RuntimeError("BLE device not set — call set_ble_device() first")
             _LOGGER.debug("%s: Connecting", self._model_id)
-            client = await establish_connection(
-                BleakClientWithServiceCache,
-                ble_device,
-                self._model_id,
-                self._disconnected_callback,
-                max_attempts=5,
-                use_services_cache=True,
-                ble_device_callback=lambda: self._ble_device or ble_device,
-            )
+            client = await self._establish_with_shutdown_backoff(ble_device)
             _LOGGER.debug("%s: Connected", self._model_id)
             self._client = client
             try:
@@ -210,11 +292,64 @@ class OolerBLEDevice:
                 self._client = None
                 await client.disconnect()
                 raise
+            # Grace period for the first post-connect notification.
+            self._last_notification_monotonic = self._monotonic()
+            if self._watchdog_enabled and (
+                self._watchdog_task is None or self._watchdog_task.done()
+            ):
+                self._watchdog_task = asyncio.create_task(
+                    self._notify_watchdog_loop()
+                )
+        self._fire_connection_event(ConnectionEventType.CONNECTED)
+
+    async def _establish_with_shutdown_backoff(
+        self, ble_device: BLEDevice
+    ) -> BleakClientWithServiceCache:
+        """Wrap establish_connection with outer retries for "already shutdown".
+
+        ``bleak_retry_connector.establish_connection`` burns its 5
+        inner attempts in ~2 seconds when the BlueZ/proxy adapter is
+        transiently unavailable (``BleakError("Bluetooth is already
+        shutdown")``). The proxy blip typically lasts ~15s, so sleep
+        ~20s between outer attempts to span the blip.
+        """
+        last_err: BleakError | None = None
+        for attempt in range(_SHUTDOWN_ERROR_MAX_ATTEMPTS):
+            try:
+                return await establish_connection(
+                    BleakClientWithServiceCache,
+                    ble_device,
+                    self._model_id,
+                    self._disconnected_callback,
+                    max_attempts=5,
+                    use_services_cache=True,
+                    ble_device_callback=lambda: self._ble_device or ble_device,
+                )
+            except BleakError as err:
+                if "Bluetooth is already shutdown" not in str(err):
+                    raise
+                last_err = err
+                if attempt == _SHUTDOWN_ERROR_MAX_ATTEMPTS - 1:
+                    break
+                _LOGGER.warning(
+                    "%s: establish_connection hit 'Bluetooth is already shutdown'"
+                    " (attempt %d/%d), backing off %ds",
+                    self._model_id,
+                    attempt + 1,
+                    _SHUTDOWN_ERROR_MAX_ATTEMPTS,
+                    _SHUTDOWN_ERROR_BACKOFF_SECONDS,
+                )
+                await asyncio.sleep(_SHUTDOWN_ERROR_BACKOFF_SECONDS)
+        assert last_err is not None
+        raise last_err
 
     def _notification_handler(
         self, _sender: BleakGATTCharacteristic, data: bytearray
     ) -> None:
         """Handle notification responses."""
+        # Stamp liveness before decoding so the watchdog sees traffic
+        # even if decoding fails for an unknown UUID.
+        self._last_notification_monotonic = self._monotonic()
         try:
             uuid = _sender.uuid
             _LOGGER.debug(
@@ -327,7 +462,7 @@ class OolerBLEDevice:
             _LOGGER.warning(
                 "%s: Poll failed, attempting reconnect", self._model_id
             )
-            await self._execute_forced_reconnect()
+            await self._execute_forced_reconnect(trigger="poll_failure")
             try:
                 state = await self._read_all_characteristics()
             except BLEAK_RETRY_EXCEPTIONS as err:
@@ -360,7 +495,7 @@ class OolerBLEDevice:
                 err,
             )
         # Second retry: full reconnect
-        await self._execute_forced_reconnect()
+        await self._execute_forced_reconnect(trigger="write_failure")
         try:
             return await operation()
         except BLEAK_RETRY_EXCEPTIONS as err:
@@ -368,10 +503,26 @@ class OolerBLEDevice:
                 f"{self._model_id}: Operation failed after reconnect: {err}"
             ) from err
 
-    async def _execute_forced_reconnect(self) -> None:
-        """Force disconnect and reconnect."""
-        _LOGGER.debug("%s: Forcing reconnect", self._model_id)
+    async def _execute_forced_reconnect(self, trigger: str = "unknown") -> None:
+        """Force disconnect and reconnect.
+
+        ``trigger`` is propagated to subscribers via a
+        :class:`ConnectionEventType.FORCED_RECONNECT` event and is one of
+        ``"notify_stall"``, ``"poll_failure"``, ``"write_failure"``.
+
+        While a forced reconnect is in flight, :pyattr:`is_connected`
+        continues to report ``True`` so downstream consumers do not
+        flap entities unavailable. If the reconnect itself fails, the
+        flag is cleared before re-raising so the normal unexpected-
+        disconnect path takes over.
+        """
+        _LOGGER.debug("%s: Forcing reconnect (trigger=%s)", self._model_id, trigger)
+        self._force_reconnecting = True
         self._expected_disconnect = True
+        self._fire_connection_event(
+            ConnectionEventType.FORCED_RECONNECT,
+            detail={"trigger": trigger},
+        )
         client = self._client
         self._client = None
         if client:
@@ -384,7 +535,17 @@ class OolerBLEDevice:
                 )
         # Brief delay to let the BLE stack clean up before reconnecting
         await asyncio.sleep(_RECONNECT_BACKOFF_SECONDS)
-        await self._ensure_connected()
+        try:
+            await self._ensure_connected()
+        except Exception:
+            # Clear flap suppression so the normal unexpected-disconnect
+            # path (and any downstream unavailability logic) takes over.
+            self._force_reconnecting = False
+            raise
+        self._force_reconnecting = False
+        self._force_reconnect_cooldown_until = (
+            self._monotonic() + _WATCHDOG_RECONNECT_COOLDOWN_SECONDS
+        )
 
     async def _write_gatt(self, char: str, data: bytes) -> None:
         """Write to a GATT characteristic with retry-on-stale logic."""
@@ -407,6 +568,12 @@ class OolerBLEDevice:
         await self._write_gatt(POWER_CHAR, power_byte)
         _LOGGER.debug("Set power to %s.", power)
         self._state.power = power
+        if not power:
+            # Grace period for the first post-power-on notification so
+            # the watchdog doesn't trip on a stale timestamp if the user
+            # toggles power quickly. (The watchdog also gates on
+            # state.power being True, so it wouldn't fire while off.)
+            self._last_notification_monotonic = self._monotonic()
 
         # When turning on, re-send mode and temperature to the device.
         # These may have been changed in HA while the Ooler was off, and the
@@ -689,17 +856,29 @@ class OolerBLEDevice:
         # Clear client immediately so is_connected returns False,
         # allowing the integration's BLE callback to trigger reconnection.
         self._client = None
-        if self._expected_disconnect:
+        expected = self._expected_disconnect
+        force_reconnecting = self._force_reconnecting
+        self._expected_disconnect = False
+        if expected:
             _LOGGER.debug("%s: Expected disconnect from device", self._model_id)
         else:
             _LOGGER.warning(
                 "%s: Unexpectedly disconnected from device", self._model_id
             )
-        self._expected_disconnect = False
+        if force_reconnecting:
+            # The forced-reconnect path owns the connection-event channel
+            # for its window. Suppress the state-callback fire too so the
+            # coordinator does not see a transient is_connected=False.
+            return
         self._fire_callbacks()
+        if not expected:
+            self._fire_connection_event(ConnectionEventType.DISCONNECTED)
 
     async def _execute_disconnect(self) -> None:
         """Execute disconnection."""
+        # Cancel the watchdog before taking the connect lock — the
+        # watchdog may itself try to acquire it during a forced reconnect.
+        await self._cancel_watchdog()
         async with self._connect_lock:
             client = self._client
             self._expected_disconnect = True
@@ -715,6 +894,92 @@ class OolerBLEDevice:
                             char,
                         )
                 await client.disconnect()
+
+    async def _cancel_watchdog(self) -> None:
+        """Cancel the notification-staleness watchdog if running."""
+        task = self._watchdog_task
+        if task is None:
+            return
+        self._watchdog_task = None
+        if task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    async def _notify_watchdog_loop(self) -> None:
+        """Background task: force reconnect on silent notify stalls.
+
+        The ESPHome BLE proxy can lose notification subscriptions after
+        an internal reconnect while GATT reads keep succeeding. This
+        loop watches the time since the last notification and forces a
+        full reconnect when the gap exceeds
+        ``_NOTIFY_STALL_TIMEOUT_SECONDS`` while the device is powered.
+        """
+        try:
+            while True:
+                await asyncio.sleep(_WATCHDOG_TICK_SECONDS)
+                try:
+                    await self._watchdog_tick()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    _LOGGER.warning(
+                        "%s: Watchdog tick raised, continuing",
+                        self._model_id,
+                        exc_info=True,
+                    )
+        except asyncio.CancelledError:
+            _LOGGER.debug("%s: Watchdog cancelled", self._model_id)
+            raise
+
+    async def _watchdog_tick(self) -> None:
+        """One iteration of the watchdog check; extracted for testability."""
+        if self._client is None or not self._client.is_connected:
+            return
+        # When the device is off, ACTUALTEMP stops updating and the
+        # notification stream goes legitimately quiet — not a stall.
+        if not self._state.power:
+            return
+        if self._last_notification_monotonic is None:
+            return
+        now = self._monotonic()
+        if now < self._force_reconnect_cooldown_until:
+            return
+        gap = now - self._last_notification_monotonic
+        if gap < _NOTIFY_STALL_TIMEOUT_SECONDS:
+            _LOGGER.debug(
+                "%s: Watchdog tick, notify gap %.1fs (threshold %ds)",
+                self._model_id,
+                gap,
+                _NOTIFY_STALL_TIMEOUT_SECONDS,
+            )
+            return
+        _LOGGER.warning(
+            "%s: Notification stream stalled for %.1fs (threshold %ds),"
+            " forcing reconnect",
+            self._model_id,
+            gap,
+            _NOTIFY_STALL_TIMEOUT_SECONDS,
+        )
+        self._fire_connection_event(
+            ConnectionEventType.NOTIFY_STALL,
+            detail={"stall_duration_seconds": gap},
+        )
+        try:
+            await self._execute_forced_reconnect(trigger="notify_stall")
+        except Exception:
+            _LOGGER.warning(
+                "%s: Forced reconnect from watchdog failed",
+                self._model_id,
+                exc_info=True,
+            )
+            # Enter cooldown even on failure so we do not tight-loop.
+            self._force_reconnect_cooldown_until = (
+                self._monotonic() + _WATCHDOG_RECONNECT_COOLDOWN_SECONDS
+            )
 
 
 def _local_now() -> datetime:

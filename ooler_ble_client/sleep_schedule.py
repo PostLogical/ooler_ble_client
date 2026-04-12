@@ -117,7 +117,7 @@ class OolerSleepSchedule:
 
 
 def decode_sleep_schedule_events(
-    times_bytes: bytes, temps_bytes: bytes
+    times_bytes: bytes | bytearray, temps_bytes: bytes | bytearray
 ) -> list[SleepScheduleEvent]:
     """Decode raw BLE bytes into a list of schedule events.
 
