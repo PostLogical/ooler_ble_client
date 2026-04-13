@@ -20,17 +20,6 @@ _LOGGER = logging.getLogger(__package__)
 
 MODE_INT_TO_MODE_STATE: list[OolerMode] = ["Silent", "Regular", "Boost"]
 
-# Notify-staleness watchdog tuning.
-# Overnight observation (2026-04-11/12) showed silent notify stalls of
-# 37-249 minutes on an ESPHome BLE proxy while reads kept succeeding. A
-# 15-minute threshold sits comfortably above healthy inter-notify gaps
-# (ACTUALTEMP drifts continuously while running) and below the shortest
-# observed stall.
-_NOTIFY_STALL_TIMEOUT_SECONDS = 900
-_WATCHDOG_TICK_SECONDS = 30
-# Don't tight-loop if a forced reconnect just ran.
-_WATCHDOG_RECONNECT_COOLDOWN_SECONDS = 60
-
 # Retry budget for BleakError("Bluetooth is already shutdown") during
 # proxy blips. ~15s of blip is covered by sleeping ~20s between outer
 # attempts.

@@ -1,6 +1,6 @@
 [project]
 name = "ooler-ble-client"
-version = "0.11.0"
+version = "0.11.1"
 description = "A library to communicate with Ooler Sleep System Bluetooth devices."
 readme = "README.md"
 license = "Apache-2.0"
@@ -35,6 +35,12 @@ packages = [{include = "ooler_ble_client"}]
 pytest = ">=7.0"
 pytest-asyncio = ">=0.21"
 pytest-cov = "^7.1.0"
+
+[tool.pytest.ini_options]
+# Only collect unit tests from tests/. The repo-root `test_*.py` files
+# are manual BLE diagnostic scripts that connect to real Ooler hardware
+# and must not be picked up by pytest.
+testpaths = ["tests"]
 
 [build-system]
 requires = ["poetry-core"]

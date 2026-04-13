@@ -30,7 +30,8 @@ class ConnectionEventType(Enum):
 
     CONNECTED = "connected"
     DISCONNECTED = "disconnected"
-    NOTIFY_STALL = "notify_stall"
+    SUBSCRIPTION_MISMATCH = "subscription_mismatch"
+    SUBSCRIPTION_RECOVERED = "subscription_recovered"
     FORCED_RECONNECT = "forced_reconnect"
 
 

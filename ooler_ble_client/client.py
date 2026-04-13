@@ -43,9 +43,6 @@ from .const import (
     TEMP_MIN_F,
     TEMP_MAX_F,
     TEMP_HI_F,
-    _NOTIFY_STALL_TIMEOUT_SECONDS,
-    _WATCHDOG_TICK_SECONDS,
-    _WATCHDOG_RECONNECT_COOLDOWN_SECONDS,
     _SHUTDOWN_ERROR_BACKOFF_SECONDS,
     _SHUTDOWN_ERROR_MAX_ATTEMPTS,
 )
@@ -98,11 +95,6 @@ def _is_valid_temp_f(temp_f: int) -> bool:
 
 class OolerBLEDevice:
 
-    # Class-level default so the test suite can disable the background
-    # watchdog task without touching every test that calls connect().
-    # Tests re-enable it per-instance when they exercise watchdog behavior.
-    _watchdog_enabled_default: ClassVar[bool] = True
-
     def __init__(self, model: str) -> None:
         """Initialize the OolerBLEDevice."""
         self._model_id = model
@@ -118,11 +110,14 @@ class OolerBLEDevice:
         self._sleep_schedule: OolerSleepSchedule | None = None
         self._sleep_schedule_events: list[SleepScheduleEvent] = []
         self._sleep_schedule_seq: int = 0
-        self._last_notification_monotonic: float | None = None
-        self._watchdog_task: asyncio.Task[None] | None = None
-        self._watchdog_enabled: bool = type(self)._watchdog_enabled_default
         self._force_reconnecting: bool = False
-        self._force_reconnect_cooldown_until: float = 0.0
+        # Poll/state consistency detector: skip the check on the first
+        # poll of any new connection (no meaningful cached baseline),
+        # then arm it for subsequent polls.
+        self._consistency_check_armed: bool = False
+        # Tier-1 re-subscribe was attempted and we are waiting for the
+        # next poll to confirm whether the mismatch cleared.
+        self._tier1_pending: bool = False
         # Indirection so tests can inject a fake monotonic clock without
         # globally patching time.monotonic.
         self._monotonic: Callable[[], float] = time.monotonic
@@ -203,8 +198,9 @@ class OolerBLEDevice:
         """Register a callback invoked on connectivity events.
 
         Delivers :class:`ConnectionEvent` instances when the device
-        connects, disconnects unexpectedly, the notify-staleness
-        watchdog trips, or a forced reconnect is initiated. The event
+        connects, disconnects unexpectedly, a poll reveals a missed
+        notification (subscription mismatch), a re-subscribe recovers
+        the subscription, or a forced reconnect is initiated. The event
         channel is independent of the state callback registered via
         :meth:`register_callback`.
 
@@ -268,6 +264,12 @@ class OolerBLEDevice:
             client = await self._establish_with_shutdown_backoff(ble_device)
             _LOGGER.debug("%s: Connected", self._model_id)
             self._client = client
+            # The internal poll below establishes the post-(re)connect
+            # baseline. Any pre-disconnect cached state is not a valid
+            # comparison target, so disarm the consistency detector
+            # until that baseline is in place.
+            self._consistency_check_armed = False
+            self._tier1_pending = False
             try:
                 # Read temperature unit once on connect (rarely changes)
                 temp_unit_byte = await client.read_gatt_char(DISPLAY_TEMPERATURE_UNIT_CHAR)
@@ -292,14 +294,6 @@ class OolerBLEDevice:
                 self._client = None
                 await client.disconnect()
                 raise
-            # Grace period for the first post-connect notification.
-            self._last_notification_monotonic = self._monotonic()
-            if self._watchdog_enabled and (
-                self._watchdog_task is None or self._watchdog_task.done()
-            ):
-                self._watchdog_task = asyncio.create_task(
-                    self._notify_watchdog_loop()
-                )
         self._fire_connection_event(ConnectionEventType.CONNECTED)
 
     async def _establish_with_shutdown_backoff(
@@ -347,9 +341,6 @@ class OolerBLEDevice:
         self, _sender: BleakGATTCharacteristic, data: bytearray
     ) -> None:
         """Handle notification responses."""
-        # Stamp liveness before decoding so the watchdog sees traffic
-        # even if decoding fails for an unknown UUID.
-        self._last_notification_monotonic = self._monotonic()
         try:
             uuid = _sender.uuid
             _LOGGER.debug(
@@ -450,7 +441,15 @@ class OolerBLEDevice:
         )
 
     async def async_poll(self) -> None:
-        """Retrieve state from device."""
+        """Retrieve state from device.
+
+        After a successful GATT read, compares the fresh values against
+        cached state on the four notify-backed fields. A disagreement
+        is positive evidence that a notification was missed, so the
+        recovery ladder in :meth:`_handle_subscription_mismatch` is
+        invoked — Tier 1 re-subscribes in place, Tier 2 forces a full
+        reconnect if a prior re-subscribe did not clear the mismatch.
+        """
         if self._client is None:
             return await self.connect()
 
@@ -470,8 +469,134 @@ class OolerBLEDevice:
                     f"{self._model_id}: Poll failed after reconnect: {err}"
                 ) from err
 
+        if self._consistency_check_armed:
+            missed_fields = self._check_notify_consistency(state)
+            if missed_fields:
+                refreshed = await self._handle_subscription_mismatch(missed_fields)
+                if refreshed:
+                    # Tier 2 ran: _execute_forced_reconnect → _ensure_connected
+                    # → an inner async_poll already applied fresh state.
+                    # Our pre-reconnect `state` value is now stale.
+                    return
+            else:
+                # Clean poll — any pending Tier 1 proved itself out.
+                self._tier1_pending = False
+
         self._set_state_and_fire_callbacks(state)
+        self._consistency_check_armed = True
         _LOGGER.debug("%s: State retrieved.", self._model_id)
+
+    _NOTIFY_BACKED_FIELDS: ClassVar[tuple[str, ...]] = (
+        "power",
+        "mode",
+        "set_temperature",
+        "actual_temperature",
+    )
+
+    def _check_notify_consistency(self, fresh: OolerBLEState) -> set[str]:
+        """Return field names where fresh poll values disagree with cached state.
+
+        Fields that are ``None`` in the cache are skipped — there is no
+        meaningful baseline to compare against (e.g., first poll after
+        instantiation before any connect).
+        """
+        missed: set[str] = set()
+        cached = self._state
+        for field in self._NOTIFY_BACKED_FIELDS:
+            cached_val = getattr(cached, field)
+            if cached_val is None:
+                continue
+            if cached_val != getattr(fresh, field):
+                missed.add(field)
+        return missed
+
+    async def _handle_subscription_mismatch(
+        self, missed_fields: set[str]
+    ) -> bool:
+        """Recover from a poll/state mismatch indicating missed notifications.
+
+        Returns ``True`` if the recovery path refreshed cached state
+        itself (Tier 2 — a forced reconnect whose inner poll already
+        applied fresh values). In that case the caller should NOT apply
+        its own pre-reconnect poll result.
+
+        Tier 1 (re-subscribe in place) returns ``False`` — the caller
+        still applies the fresh poll values it just read, which become
+        the new cached baseline for the next poll's consistency check.
+        """
+        sorted_fields = sorted(missed_fields)
+        self._fire_connection_event(
+            ConnectionEventType.SUBSCRIPTION_MISMATCH,
+            detail={"fields": sorted_fields},
+        )
+        _LOGGER.warning(
+            "%s: Poll revealed missed notification(s) on %s; subscription suspect",
+            self._model_id,
+            sorted_fields,
+        )
+
+        if self._tier1_pending:
+            _LOGGER.warning(
+                "%s: Re-subscribe did not resolve mismatch; forcing reconnect",
+                self._model_id,
+            )
+            try:
+                await self._execute_forced_reconnect(
+                    trigger="subscription_mismatch"
+                )
+            except Exception:
+                _LOGGER.warning(
+                    "%s: Forced reconnect from subscription mismatch failed",
+                    self._model_id,
+                    exc_info=True,
+                )
+                return False
+            return True
+
+        client = self._client
+        if client is None or not client.is_connected:
+            # Nothing to re-subscribe on. Leave _tier1_pending unset so
+            # the next poll still treats this as a fresh mismatch.
+            return False
+
+        try:
+            for char in (POWER_CHAR, MODE_CHAR, SETTEMP_CHAR, ACTUALTEMP_CHAR):
+                try:
+                    await client.stop_notify(char)
+                except Exception:
+                    _LOGGER.debug(
+                        "%s: stop_notify(%s) raised during re-subscribe, ignoring",
+                        self._model_id,
+                        char,
+                    )
+                await client.start_notify(char, self._notification_handler)
+        except Exception:
+            _LOGGER.warning(
+                "%s: Re-subscribe failed, escalating to forced reconnect",
+                self._model_id,
+                exc_info=True,
+            )
+            try:
+                await self._execute_forced_reconnect(
+                    trigger="subscription_mismatch"
+                )
+            except Exception:
+                _LOGGER.warning(
+                    "%s: Forced reconnect from failed re-subscribe also failed",
+                    self._model_id,
+                    exc_info=True,
+                )
+                return False
+            return True
+
+        self._tier1_pending = True
+        self._fire_connection_event(ConnectionEventType.SUBSCRIPTION_RECOVERED)
+        _LOGGER.info(
+            "%s: Re-subscribed to notification characteristics; "
+            "next poll will confirm",
+            self._model_id,
+        )
+        return False
 
     async def _retry_on_stale(self, operation: Callable[[], Coroutine[Any, Any, Any]]) -> Any:
         """Execute a GATT operation with two levels of retry.
@@ -519,6 +644,11 @@ class OolerBLEDevice:
         _LOGGER.debug("%s: Forcing reconnect (trigger=%s)", self._model_id, trigger)
         self._force_reconnecting = True
         self._expected_disconnect = True
+        # Disarm the consistency detector so the post-reconnect internal
+        # poll in _ensure_connected doesn't flag pre-reconnect cache
+        # against post-reconnect device state.
+        self._consistency_check_armed = False
+        self._tier1_pending = False
         self._fire_connection_event(
             ConnectionEventType.FORCED_RECONNECT,
             detail={"trigger": trigger},
@@ -543,9 +673,6 @@ class OolerBLEDevice:
             self._force_reconnecting = False
             raise
         self._force_reconnecting = False
-        self._force_reconnect_cooldown_until = (
-            self._monotonic() + _WATCHDOG_RECONNECT_COOLDOWN_SECONDS
-        )
 
     async def _write_gatt(self, char: str, data: bytes) -> None:
         """Write to a GATT characteristic with retry-on-stale logic."""
@@ -568,12 +695,6 @@ class OolerBLEDevice:
         await self._write_gatt(POWER_CHAR, power_byte)
         _LOGGER.debug("Set power to %s.", power)
         self._state.power = power
-        if not power:
-            # Grace period for the first post-power-on notification so
-            # the watchdog doesn't trip on a stale timestamp if the user
-            # toggles power quickly. (The watchdog also gates on
-            # state.power being True, so it wouldn't fire while off.)
-            self._last_notification_monotonic = self._monotonic()
 
         # When turning on, re-send mode and temperature to the device.
         # These may have been changed in HA while the Ooler was off, and the
@@ -876,9 +997,6 @@ class OolerBLEDevice:
 
     async def _execute_disconnect(self) -> None:
         """Execute disconnection."""
-        # Cancel the watchdog before taking the connect lock — the
-        # watchdog may itself try to acquire it during a forced reconnect.
-        await self._cancel_watchdog()
         async with self._connect_lock:
             client = self._client
             self._expected_disconnect = True
@@ -894,93 +1012,6 @@ class OolerBLEDevice:
                             char,
                         )
                 await client.disconnect()
-
-    async def _cancel_watchdog(self) -> None:
-        """Cancel the notification-staleness watchdog if running."""
-        task = self._watchdog_task
-        if task is None:
-            return
-        self._watchdog_task = None
-        if task.done():
-            return
-        task.cancel()
-        try:
-            await task
-        except (asyncio.CancelledError, Exception):
-            pass
-
-    async def _notify_watchdog_loop(self) -> None:
-        """Background task: force reconnect on silent notify stalls.
-
-        The ESPHome BLE proxy can lose notification subscriptions after
-        an internal reconnect while GATT reads keep succeeding. This
-        loop watches the time since the last notification and forces a
-        full reconnect when the gap exceeds
-        ``_NOTIFY_STALL_TIMEOUT_SECONDS`` while the device is powered.
-        """
-        try:
-            while True:
-                await asyncio.sleep(_WATCHDOG_TICK_SECONDS)
-                try:
-                    await self._watchdog_tick()
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    _LOGGER.warning(
-                        "%s: Watchdog tick raised, continuing",
-                        self._model_id,
-                        exc_info=True,
-                    )
-        except asyncio.CancelledError:
-            _LOGGER.debug("%s: Watchdog cancelled", self._model_id)
-            raise
-
-    async def _watchdog_tick(self) -> None:
-        """One iteration of the watchdog check; extracted for testability."""
-        if self._client is None or not self._client.is_connected:
-            return
-        # When the device is off, ACTUALTEMP stops updating and the
-        # notification stream goes legitimately quiet — not a stall.
-        if not self._state.power:
-            return
-        if self._last_notification_monotonic is None:
-            return
-        now = self._monotonic()
-        if now < self._force_reconnect_cooldown_until:
-            return
-        gap = now - self._last_notification_monotonic
-        if gap < _NOTIFY_STALL_TIMEOUT_SECONDS:
-            _LOGGER.debug(
-                "%s: Watchdog tick, notify gap %.1fs (threshold %ds)",
-                self._model_id,
-                gap,
-                _NOTIFY_STALL_TIMEOUT_SECONDS,
-            )
-            return
-        _LOGGER.warning(
-            "%s: Notification stream stalled for %.1fs (threshold %ds),"
-            " forcing reconnect",
-            self._model_id,
-            gap,
-            _NOTIFY_STALL_TIMEOUT_SECONDS,
-        )
-        self._fire_connection_event(
-            ConnectionEventType.NOTIFY_STALL,
-            detail={"stall_duration_seconds": gap},
-        )
-        try:
-            await self._execute_forced_reconnect(trigger="notify_stall")
-        except Exception:
-            _LOGGER.warning(
-                "%s: Forced reconnect from watchdog failed",
-                self._model_id,
-                exc_info=True,
-            )
-            # Enter cooldown even on failure so we do not tight-loop.
-            self._force_reconnect_cooldown_until = (
-                self._monotonic() + _WATCHDOG_RECONNECT_COOLDOWN_SECONDS
-            )
-
 
 def _local_now() -> datetime:
     """Get the current local time with the best available timezone info.

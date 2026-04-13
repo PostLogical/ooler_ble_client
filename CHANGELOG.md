@@ -1,11 +1,23 @@
 # Changelog
 
+## 0.11.1
+
+### Changed
+- **Replaced the notification-staleness watchdog with a poll/state consistency detector.** The 0.11.0 watchdog watched for absence of notifications and force-reconnected after a 15-minute silence. Overnight soak (2026-04-12/13) revealed that during "coast" periods (at setpoint, pump off, ACTUALTEMP genuinely stable) all four subscribed characteristics legitimately go silent for 15+ minutes, producing 30 spurious forced reconnects in a 15.5h window that cascaded at exact 15-minute intervals. The new detector instead compares every successful `async_poll()` against cached state on the four notify-backed fields (power, mode, set_temperature, actual_temperature). A disagreement is positive evidence that a notification was missed, and the recovery ladder re-subscribes in place (Tier 1, `stop_notify` + `start_notify` on the existing client) and only escalates to a full forced reconnect if the next poll still shows a mismatch (Tier 2). The detector runs inside `async_poll` with no background task, no tunable threshold, and zero false positives during coast.
+- `ConnectionEventType`: removed `NOTIFY_STALL`. Added `SUBSCRIPTION_MISMATCH` (detail includes sorted `fields` list) and `SUBSCRIPTION_RECOVERED`. `FORCED_RECONNECT` gains a new `trigger` value, `"subscription_mismatch"`, emitted on Tier 2 escalation.
+
+### Removed
+- `_NOTIFY_STALL_TIMEOUT_SECONDS`, `_WATCHDOG_TICK_SECONDS`, `_WATCHDOG_RECONNECT_COOLDOWN_SECONDS` constants
+- `_notify_watchdog_loop`, `_watchdog_tick`, `_cancel_watchdog` methods
+- `_last_notification_monotonic`, `_watchdog_task`, `_force_reconnect_cooldown_until` instance state
+- `_watchdog_enabled_default` class attribute and the `_disable_notify_watchdog` autouse test fixture
+
 ## 0.11.0
 
 ### Added
-- **Notification-staleness watchdog** -- background task that forces a reconnect when the notification stream has been silent for longer than 15 minutes while the device is powered. Addresses silent 37-249 minute notify stalls observed on ESPHome BLE proxies where reads kept succeeding but the subscription state had been lost during a proxy-internal reconnect.
+- **Notification-staleness watchdog** -- background task that forces a reconnect when the notification stream has been silent for longer than 15 minutes while the device is powered. Addresses silent 37-249 minute notify stalls observed on ESPHome BLE proxies where reads kept succeeding but the subscription state had been lost during a proxy-internal reconnect. (Superseded in 0.11.1 by the poll/state consistency detector.)
 - **Connection-event channel** -- new `register_connection_event_callback()` API delivering `ConnectionEvent` instances on connect, unexpected disconnect, notify stall, and forced reconnect. Independent of the existing state callback.
-  - `ConnectionEventType` -- enum: `CONNECTED`, `DISCONNECTED`, `NOTIFY_STALL`, `FORCED_RECONNECT`
+  - `ConnectionEventType` -- enum: `CONNECTED`, `DISCONNECTED`, `NOTIFY_STALL`, `FORCED_RECONNECT` (the `NOTIFY_STALL` variant was removed in 0.11.1)
   - `ConnectionEvent` -- frozen dataclass with `type`, `timestamp` (monotonic), and `detail` payload
   - `NOTIFY_STALL` detail includes `stall_duration_seconds`
   - `FORCED_RECONNECT` detail includes `trigger` (`"notify_stall"`, `"poll_failure"`, or `"write_failure"`)
