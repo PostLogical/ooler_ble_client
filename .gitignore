@@ -147,3 +147,9 @@ cython_debug/
 
 # Dev Container Settings
 *.code-workspace
+
+# BLE diagnostic snapshots
+snapshots/
+
+# Local working files (prompts, notes, etc.)
+local/
