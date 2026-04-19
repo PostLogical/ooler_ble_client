@@ -69,12 +69,37 @@ Main client class.
 - `set_temperature(int)` -- set target temperature in the current display unit
 - `set_clean(bool)` -- start/stop clean cycle (automatically powers on)
 - `set_temperature_unit(TemperatureUnit)` -- set device display unit: `"C"` or `"F"`
+- `address` -- BLE device address
+- `register_connection_event_callback(fn)` -- register a connectivity event callback, returns an unsubscribe function
+
+#### Sleep schedule methods
+
+- `read_sleep_schedule()` -- read the schedule from the device (updates cache)
+- `set_sleep_schedule(nights)` -- write a structured schedule (list of `SleepScheduleNight`)
+- `set_sleep_schedule_events(events)` -- write a flat event list directly
+- `clear_sleep_schedule()` -- clear the schedule on the device
+- `sync_clock(now=None)` -- sync the device's internal clock (used for schedule execution). Pass a timezone-aware datetime, or omit to use the system timezone.
+- `sleep_schedule` -- cached `OolerSleepSchedule` (or `None` if not yet read)
+- `sleep_schedule_events` -- cached schedule as a flat `list[SleepScheduleEvent]`
 
 ### `OolerBLEState`
 
 Dataclass with fields: `power`, `mode`, `set_temperature`, `actual_temperature`, `water_level`, `clean`, `temperature_unit`.
 
-### Types
+### Sleep Schedule Types
+
+- `OolerSleepSchedule` -- weekly schedule containing a list of `SleepScheduleNight` and a sequence counter
+- `SleepScheduleNight` -- one night's program: day (0=Mon), temperature steps, off time, optional warm wake
+- `SleepScheduleEvent` -- a single event in the flat wire format (minute of week + temperature). Minute of week is minutes elapsed since Monday 00:00 (e.g. Tuesday 6:00am = 1800).
+- `WarmWake` -- warm wake configuration: target temperature and duration in minutes
+- `build_sleep_schedule(bedtime, wake_time, temp_f, ...)` -- convenience builder for uniform schedules (same program across selected days, with optional warm wake and extra temperature steps)
+
+### Connection Events
+
+- `ConnectionEvent` -- a connectivity event with `type`, `timestamp`, and optional `detail`
+- `ConnectionEventType` -- enum: `CONNECTED`, `DISCONNECTED`, `SUBSCRIPTION_MISMATCH`, `SUBSCRIPTION_RECOVERED`, `FORCED_RECONNECT`
+
+### Other Types
 
 - `OolerMode` -- `Literal["Silent", "Regular", "Boost"]`
 - `TemperatureUnit` -- `Literal["C", "F"]`

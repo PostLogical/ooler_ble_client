@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import asyncio
 import random
+from contextlib import AbstractContextManager
 from unittest.mock import MagicMock, AsyncMock, patch
 
 import pytest
 from bleak.exc import BleakError
+from bleak_retry_connector import BleakClientWithServiceCache
 
 from ooler_ble_client import OolerBLEDevice, OolerBLEState, OolerConnectionError
 from ooler_ble_client.const import (
@@ -93,7 +95,7 @@ def _make_mock_client(reads: list[bytes] | None = None) -> MagicMock:
     return client
 
 
-def _patch_establish(mock_client: MagicMock):  # type: ignore[no-untyped-def]
+def _patch_establish(mock_client: MagicMock) -> AbstractContextManager[AsyncMock]:
     """Patch establish_connection to return a mock client."""
     return patch(
         "ooler_ble_client.client.establish_connection",
@@ -102,7 +104,7 @@ def _patch_establish(mock_client: MagicMock):  # type: ignore[no-untyped-def]
     )
 
 
-def _patch_sleep():  # type: ignore[no-untyped-def]
+def _patch_sleep() -> AbstractContextManager[AsyncMock]:
     """Patch asyncio.sleep to be instant."""
     return patch("asyncio.sleep", new_callable=AsyncMock)
 
@@ -1017,7 +1019,7 @@ class TestEnsureConnected:
 
         connected_order: list[int] = []
 
-        async def slow_establish(*args, **kwargs):  # type: ignore[no-untyped-def]
+        async def slow_establish(*args: object, **kwargs: object) -> MagicMock:
             await asyncio.sleep(0)
             connected_order.append(len(connected_order))
             return mock_client
@@ -1077,10 +1079,10 @@ class TestForcedReconnect:
         expected_values: list[bool] = []
         original_disconnect = device._disconnected_callback
 
-        def capture_expected(client: MagicMock) -> None:
+        def capture_expected(client: BleakClientWithServiceCache | None) -> None:
             expected_values.append(device._expected_disconnect)
 
-        device._disconnected_callback = capture_expected  # type: ignore[assignment]
+        device._disconnected_callback = capture_expected  # type: ignore[method-assign]
 
         with _patch_establish(new_client), _patch_sleep():
             await device._execute_forced_reconnect()
@@ -1508,7 +1510,7 @@ class TestStopDuringConnect:
         connect_started = asyncio.Event()
         connect_proceed = asyncio.Event()
 
-        async def slow_establish(*args, **kwargs):  # type: ignore[no-untyped-def]
+        async def slow_establish(*args: object, **kwargs: object) -> MagicMock:
             connect_started.set()
             await connect_proceed.wait()
             return mock_client
@@ -1868,7 +1870,7 @@ class TestSleepScheduleConnectGuards:
         async def fake_connect() -> None:
             device._client = None  # simulate failed connect
 
-        device.connect = fake_connect  # type: ignore[assignment]
+        device.connect = fake_connect  # type: ignore[method-assign]
         with pytest.raises(RuntimeError, match="Failed to connect"):
             await device.read_sleep_schedule()
 
@@ -1880,7 +1882,7 @@ class TestSleepScheduleConnectGuards:
         async def fake_connect() -> None:
             device._client = None
 
-        device.connect = fake_connect  # type: ignore[assignment]
+        device.connect = fake_connect  # type: ignore[method-assign]
         with pytest.raises(RuntimeError, match="Failed to connect"):
             await device.set_sleep_schedule_events([])
 
@@ -2039,6 +2041,8 @@ class TestSyncClock:
                 return None
             def dst(self, dt: datetime | None) -> None:
                 return None
+            def tzname(self, dt: datetime | None) -> str | None:
+                return None
 
         device, _ = _make_connected_device()
         with pytest.raises(ValueError, match="UTC offset"):
@@ -2085,6 +2089,6 @@ class TestSyncClock:
         async def fake_connect() -> None:
             device._client = None
 
-        device.connect = fake_connect  # type: ignore[assignment]
+        device.connect = fake_connect  # type: ignore[method-assign]
         with pytest.raises(RuntimeError, match="Failed to connect"):
             await device.sync_clock()

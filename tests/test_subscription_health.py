@@ -10,6 +10,7 @@ only if the next poll still shows a mismatch (Tier 2).
 """
 from __future__ import annotations
 
+from contextlib import AbstractContextManager
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -54,7 +55,7 @@ def _make_mock_client(reads: list[bytes] | None = None) -> MagicMock:
     return client
 
 
-def _patch_establish(mock_client: MagicMock):  # type: ignore[no-untyped-def]
+def _patch_establish(mock_client: MagicMock) -> AbstractContextManager[AsyncMock]:
     return patch(
         "ooler_ble_client.client.establish_connection",
         new_callable=AsyncMock,
@@ -62,7 +63,7 @@ def _patch_establish(mock_client: MagicMock):  # type: ignore[no-untyped-def]
     )
 
 
-def _patch_sleep():  # type: ignore[no-untyped-def]
+def _patch_sleep() -> AbstractContextManager[AsyncMock]:
     return patch("asyncio.sleep", new_callable=AsyncMock)
 
 
@@ -336,6 +337,65 @@ class TestAsyncPollConsistency:
         client.start_notify.side_effect = BleakError("CCCD write failed")
 
         reconnect_mock = AsyncMock()
+        device._execute_forced_reconnect = reconnect_mock  # type: ignore[method-assign]
+
+        await device.async_poll()
+        reconnect_mock.assert_awaited_once_with(trigger="subscription_mismatch")
+
+    @pytest.mark.asyncio
+    async def test_tier2_forced_reconnect_failure(self) -> None:
+        """When Tier 2 forced reconnect raises, the handler returns False."""
+        device, client = _make_connected_powered_device()
+        client.read_gatt_char.side_effect = (
+            _poll_reads(actualtemp=76) + _poll_reads(actualtemp=78)
+        )
+
+        reconnect_mock = AsyncMock(side_effect=BleakError("reconnect failed"))
+        device._execute_forced_reconnect = reconnect_mock  # type: ignore[method-assign]
+
+        # Poll 1: Tier 1
+        await device.async_poll()
+        assert device._tier1_pending is True
+
+        # Poll 2: Tier 2, but forced reconnect fails
+        await device.async_poll()
+        reconnect_mock.assert_awaited_once_with(trigger="subscription_mismatch")
+
+    @pytest.mark.asyncio
+    async def test_resubscribe_on_disconnected_client(self) -> None:
+        """When client is disconnected during re-subscribe, returns False
+        and leaves tier1_pending unset for a fresh attempt."""
+        device, client = _make_connected_powered_device()
+        client.read_gatt_char.side_effect = _poll_reads(actualtemp=76)
+
+        # Poll triggers mismatch, then we disconnect before re-subscribe
+        client.is_connected = False
+        device._client = None
+
+        result = await device._handle_subscription_mismatch({"actual_temperature"})
+        assert result is False
+        assert device._tier1_pending is False
+
+    @pytest.mark.asyncio
+    async def test_stop_notify_exception_is_swallowed(self) -> None:
+        """stop_notify raising is logged but does not prevent re-subscribe."""
+        device, client = _make_connected_powered_device()
+        client.read_gatt_char.side_effect = _poll_reads(actualtemp=76)
+        client.stop_notify.side_effect = BleakError("stop failed")
+
+        await device.async_poll()
+        # Re-subscribe succeeded (start_notify didn't raise), so Tier 1
+        assert device._tier1_pending is True
+
+    @pytest.mark.asyncio
+    async def test_resubscribe_fails_and_escalation_also_fails(self) -> None:
+        """When start_notify raises and the escalated forced reconnect also
+        raises, the handler returns False."""
+        device, client = _make_connected_powered_device()
+        client.read_gatt_char.side_effect = _poll_reads(actualtemp=76)
+        client.start_notify.side_effect = BleakError("CCCD write failed")
+
+        reconnect_mock = AsyncMock(side_effect=BleakError("reconnect failed"))
         device._execute_forced_reconnect = reconnect_mock  # type: ignore[method-assign]
 
         await device.async_poll()

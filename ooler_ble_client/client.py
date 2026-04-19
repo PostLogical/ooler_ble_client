@@ -5,7 +5,9 @@ import struct
 import time
 from collections.abc import Callable, Coroutine
 from datetime import datetime, timezone
-from typing import Any, ClassVar
+from typing import Any, ClassVar, TypeVar
+
+_T = TypeVar("_T")
 
 from bleak.backends.device import BLEDevice
 from bleak.backends.characteristic import BleakGATTCharacteristic
@@ -598,7 +600,7 @@ class OolerBLEDevice:
         )
         return False
 
-    async def _retry_on_stale(self, operation: Callable[[], Coroutine[Any, Any, Any]]) -> Any:
+    async def _retry_on_stale(self, operation: Callable[[], Coroutine[Any, Any, _T]]) -> _T:
         """Execute a GATT operation with two levels of retry.
 
         First retry: immediate (handles transient proxy hiccups).
