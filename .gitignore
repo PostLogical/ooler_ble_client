@@ -150,3 +150,6 @@ cython_debug/
 
 # BLE diagnostic snapshots
 snapshots/
+
+# Local working files (prompts, notes, etc.)
+local/
