@@ -635,7 +635,7 @@ class OolerBLEDevice:
 
         ``trigger`` is propagated to subscribers via a
         :class:`ConnectionEventType.FORCED_RECONNECT` event and is one of
-        ``"notify_stall"``, ``"poll_failure"``, ``"write_failure"``.
+        ``"subscription_mismatch"``, ``"poll_failure"``, ``"write_failure"``.
 
         While a forced reconnect is in flight, :pyattr:`is_connected`
         continues to report ``True`` so downstream consumers do not
