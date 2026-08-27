@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import suppress
 import random
-from contextlib import AbstractContextManager
+from collections.abc import Iterator
+from contextlib import AbstractContextManager, contextmanager, suppress
 from unittest.mock import MagicMock, AsyncMock, patch
 
 import pytest
@@ -60,14 +60,16 @@ def _make_sender(uuid: str) -> MagicMock:
     return sender
 
 
-def _window_already_expired() -> AbstractContextManager[None]:
+@contextmanager
+def _window_already_expired() -> Iterator[None]:
     """Make the stuck-setpoint watch time out immediately.
 
     A negative window puts the deadline in the past, so the watch gives up on
     its first check. Simpler and less brittle than feeding a fake clock, which
     would have to match the number of internal monotonic() calls.
     """
-    return patch("ooler_ble_client.client.STUCK_SETPOINT_WATCH_SECONDS", -1)
+    with patch("ooler_ble_client.client.STUCK_SETPOINT_WATCH_SECONDS", new=-1):
+        yield
 
 
 async def _cancel_stuck_setpoint_watch(device: OolerBLEDevice) -> None:
