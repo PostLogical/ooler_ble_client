@@ -1,5 +1,65 @@
 # Changelog
 
+## 1.1.0b1
+
+Beta. The setpoint-restore repair has not yet been exercised against real
+hardware through the automatic path -- see Unverified below.
+
+### Added
+- **Stuck-setpoint bug detection and repair.** A deep clean run to completion
+  commits the device's current setpoint to non-volatile storage and makes the
+  device restore it on every subsequent power-off, silently discarding anything
+  set afterwards. Reproduced in both directions on two devices (firmware 15.20),
+  armed via Home Assistant on one and the official app on the other, so it is
+  firmware behaviour and not client-specific.
+  - `clear_stuck_setpoint_bug(setpoint=None)` -- starts a clean and cancels it,
+    which is the only thing that clears the state. A clean left to finish never
+    can: it ends by powering the device off and so never sends `CLEAN=0`.
+    Optionally leaves the device at a given temperature, and restores the power
+    state it found.
+  - Every power-off starts a watch. A setpoint change while the device stays off
+    can only be the device's own doing, since it drops writes while off and its
+    single-connection limit means nothing else can be writing.
+  - `ConnectionEventType.STUCK_SETPOINT_REPAIRED` -- detail carries `wanted` and
+    `stuck_at`. Emitted so the brief pump run and setpoint blip are explained.
+  - `ConnectionEventType.STUCK_SETPOINT_UNFIXABLE` -- detail carries
+    `consecutive`. Emitted after `MAX_STUCK_SETPOINT_REPAIRS` repairs fail to
+    stick, at which point the client stops running the pump to no effect.
+  - `OolerBLEDevice(model, auto_clear_stuck_setpoint_bug=False)` disables the
+    repair while leaving detection and events intact.
+- `diagnostics/capture.py` -- labelled snapshot of every Ooler in range, diffed
+  against the previous capture with sensor noise separated from real changes.
+
+### Fixed
+- `set_clean(False)` no longer powers the device on. The power-on branch ran for
+  stopping as well as starting, so telling an idle device to stop cleaning woke
+  it and resent mode and temperature. The device drops writes while off, so it
+  now skips and warns, matching `set_temperature_unit`.
+
+### Changed
+- `SUB_FIRMWARE_CHAR` renamed to `UNKNOWN_9A5F_CHAR`. It is not a firmware
+  version: it moves with use, and fell from `"1024.80"` to `"1.x"` across a
+  factory reset and a long power loss. A runtime-proportional model was tried and
+  falsified -- `RUNTIME` and `LIFETIME` both *decrease* across an abrupt power
+  cut, so they are not monotonic.
+- `UNKNOWN_9234` documentation corrected. Its previous annotation linked it to a
+  temperature revert bug; that was coincidence. It is read/notify only and
+  fluctuates between reads on an untouched device.
+- `DEVICE_LOGS` record format documented in `const.py`: 6-byte
+  `(code, param, ts)` records where `ts` is an age in seconds, with opcodes
+  confirmed by controlled writes. Reading the log drains it, so the client does
+  not read it; this is for debugging only.
+
+### Unverified
+- `CLEAN_TOGGLE_SECONDS` is 3. The only value proven by hand is 20. If it is too
+  short the repair silently does nothing; `STUCK_SETPOINT_UNFIXABLE` bounds that
+  to three attempts rather than forever.
+- The automatic detect-and-repair path has not run against hardware. All
+  hardware confirmation to date used manual toggles.
+- Repeated deep cleans with no ordinary use between them can trip the give-up
+  counter, since each legitimately re-arms the device. It self-heals on the next
+  normal power-off.
+
 ## 0.11.1
 
 ### Changed
