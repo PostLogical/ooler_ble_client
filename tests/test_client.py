@@ -2182,7 +2182,7 @@ class TestStuckSetpointBug:
         assert [e.type for e in events] == [
             ConnectionEventType.STUCK_SETPOINT_DETECTED
         ]
-        assert events[0].detail == {"wanted": 62, "stuck_at": 71, "repaired": True}
+        assert events[0].detail == {"trigger": "observed", "wanted": 62, "stuck_at": 71, "repaired": True}
         # Repaired back to what was asked for, not what the device substituted.
         assert device.state.set_temperature == 62
 
@@ -2230,7 +2230,7 @@ class TestStuckSetpointBug:
         assert [e.type for e in events] == [
             ConnectionEventType.STUCK_SETPOINT_DETECTED
         ]
-        assert events[0].detail == {"wanted": 62, "stuck_at": 71, "repaired": False}
+        assert events[0].detail == {"trigger": "observed", "wanted": 62, "stuck_at": 71, "repaired": False}
         assert device._stuck_setpoint_repairs == 0
         client.write_gatt_char.assert_not_called()
 
@@ -2413,7 +2413,7 @@ class TestStuckSetpointBug:
         with patch("asyncio.sleep", AsyncMock(side_effect=_firmware_reverts)):
             await device._watch_for_stuck_setpoint()
 
-        assert events[0].detail == {"wanted": 85, "stuck_at": 85, "repaired": True}
+        assert events[0].detail == {"trigger": "observed", "wanted": 85, "stuck_at": 85, "repaired": True}
         assert device.state.set_temperature == 85
 
     @pytest.mark.asyncio
@@ -2472,3 +2472,60 @@ class TestStuckSetpointBug:
             ConnectionEventType.STUCK_SETPOINT_RECOVERED
         ]
         assert device._last_stuck_at is None
+
+    @pytest.mark.asyncio
+    async def test_completed_clean_is_repaired_without_waiting_for_the_symptom(
+        self,
+    ) -> None:
+        """A completed clean is known to arm the bug. Waiting for the symptom
+        costs the user a setting, since the firmware restores the pre-clean
+        setpoint and the bug does not bite until their next change."""
+        device, client = _make_connected_device(power=True)
+        await device.set_temperature(85)
+        device._state.clean = True
+        events: list[ConnectionEvent] = []
+        device.register_connection_event_callback(events.append)
+
+        with patch("asyncio.sleep", AsyncMock()):
+            device._notification_handler(
+                _make_sender(POWER_CHAR), bytearray(b"\x00")
+            )
+            task = device._stuck_setpoint_task
+            assert task is not None
+            await task
+
+        assert [e.type for e in events] == [
+            ConnectionEventType.STUCK_SETPOINT_DETECTED
+        ]
+        assert events[0].detail == {
+            "trigger": "clean_completed",
+            "wanted": 85,
+            "stuck_at": None,
+            "repaired": True,
+        }
+
+    @pytest.mark.asyncio
+    async def test_completed_clean_reports_without_acting_when_opted_out(self) -> None:
+        device, client = _make_connected_device(power=True)
+        device._auto_clear_stuck_setpoint_bug = False
+        await device.set_temperature(85)
+        device._state.clean = True
+        client.write_gatt_char.reset_mock()
+        events: list[ConnectionEvent] = []
+        device.register_connection_event_callback(events.append)
+
+        with patch("asyncio.sleep", AsyncMock()):
+            device._notification_handler(
+                _make_sender(POWER_CHAR), bytearray(b"\x00")
+            )
+            task = device._stuck_setpoint_task
+            assert task is not None
+            await task
+
+        assert events[0].detail == {
+            "trigger": "clean_completed",
+            "wanted": 85,
+            "stuck_at": None,
+            "repaired": False,
+        }
+        client.write_gatt_char.assert_not_called()

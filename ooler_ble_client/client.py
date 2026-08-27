@@ -374,6 +374,11 @@ class OolerBLEDevice:
             changed = False
             if uuid == POWER_CHAR:
                 power = bool(int.from_bytes(data, "little"))
+                # A clean that ends by powering the device off ran to
+                # completion, which is what arms the bug. Polled rather than
+                # notified, so this can be missed -- the watch below still
+                # catches it, just not until the symptom appears.
+                after_clean = not power and bool(self._state.clean)
                 if self._state.power != power:
                     self._state.power = power
                     changed = True
@@ -386,7 +391,7 @@ class OolerBLEDevice:
                     or self._stuck_setpoint_task.done()
                 ):
                     self._stuck_setpoint_task = asyncio.create_task(
-                        self._watch_for_stuck_setpoint()
+                        self._watch_for_stuck_setpoint(after_clean=after_clean)
                     )
             elif uuid == MODE_CHAR:
                 mode_int = int.from_bytes(data, "little")
@@ -854,8 +859,14 @@ class OolerBLEDevice:
         # notifying, so tell consumers where the device ended up.
         self._fire_callbacks()
 
-    async def _watch_for_stuck_setpoint(self) -> None:
+    async def _watch_for_stuck_setpoint(self, after_clean: bool = False) -> None:
         """After a power-off, repair the device if it moves the setpoint itself.
+
+        ``after_clean`` means the power-off ended a deep clean, which is known
+        to arm the bug, so the repair runs at once instead of waiting for the
+        symptom. Waiting would cost the user a setting: the firmware restores
+        the pre-clean setpoint, so the first revert is invisible and the bug
+        does not bite until their next temperature change.
 
         A setpoint change while the device stays off can only be the device's
         own doing: it drops writes while off, and its single-connection limit
@@ -874,6 +885,26 @@ class OolerBLEDevice:
         )
         deadline = self._monotonic() + STUCK_SETPOINT_WATCH_SECONDS
         try:
+            if after_clean:
+                _LOGGER.info(
+                    "%s: Deep clean completed, which leaves the setpoint stuck; "
+                    "clearing it without waiting for the symptom.",
+                    self._model_id,
+                )
+                if self._auto_clear_stuck_setpoint_bug:
+                    await self.clear_stuck_setpoint_bug(
+                        setpoint=wanted, seconds=CLEAN_TOGGLE_SECONDS[0]
+                    )
+                self._fire_connection_event(
+                    ConnectionEventType.STUCK_SETPOINT_DETECTED,
+                    {
+                        "trigger": "clean_completed",
+                        "wanted": wanted,
+                        "stuck_at": None,
+                        "repaired": self._auto_clear_stuck_setpoint_bug,
+                    },
+                )
+                return
             while self._state.set_temperature == baseline:
                 if self._state.power:
                     # Back in use before anything happened. Proves nothing
@@ -920,7 +951,12 @@ class OolerBLEDevice:
                 )
                 self._fire_connection_event(
                     ConnectionEventType.STUCK_SETPOINT_DETECTED,
-                    {"wanted": wanted, "stuck_at": stuck_at, "repaired": False},
+                    {
+                        "trigger": "observed",
+                        "wanted": wanted,
+                        "stuck_at": stuck_at,
+                        "repaired": False,
+                    },
                 )
                 return
             attempt = self._stuck_setpoint_repairs
@@ -956,7 +992,12 @@ class OolerBLEDevice:
             await self.clear_stuck_setpoint_bug(setpoint=wanted, seconds=seconds)
             self._fire_connection_event(
                 ConnectionEventType.STUCK_SETPOINT_DETECTED,
-                {"wanted": wanted, "stuck_at": stuck_at, "repaired": True},
+                {
+                    "trigger": "observed",
+                    "wanted": wanted,
+                    "stuck_at": stuck_at,
+                    "repaired": True,
+                },
             )
         except Exception as err:  # noqa: BLE001 - background task, nothing to raise to
             _LOGGER.warning(

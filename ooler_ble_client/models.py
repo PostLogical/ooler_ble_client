@@ -35,12 +35,20 @@ class ConnectionEventType(Enum):
     FORCED_RECONNECT = "forced_reconnect"
     #: The device was caught replacing the setpoint on its own after being
     #: powered off -- see :meth:`OolerBLEDevice.clear_stuck_setpoint_bug`.
-    #: ``detail`` carries ``wanted`` (the setpoint before the device interfered),
-    #: ``stuck_at`` (what it substituted) and ``repaired`` (whether the client
-    #: acted; ``False`` when ``auto_clear_stuck_setpoint_bug`` is off, in which
-    #: case nothing on the device was changed). Worth surfacing when
-    #: ``repaired``: the repair briefly runs the pump and moves the setpoint,
-    #: which is otherwise unexplained in a consumer's history.
+    #: ``detail`` carries ``trigger``, ``wanted`` (the setpoint to end up at),
+    #: ``stuck_at`` and ``repaired`` (whether the client acted; ``False`` when
+    #: ``auto_clear_stuck_setpoint_bug`` is off, in which case nothing on the
+    #: device was changed).
+    #:
+    #: ``trigger`` is ``"clean_completed"`` when a deep clean finished, which is
+    #: known to arm the bug and is repaired at once rather than waiting for the
+    #: symptom -- ``stuck_at`` is ``None`` there, because nothing was
+    #: substituted yet. It is ``"observed"`` when the device was actually caught
+    #: substituting the setpoint, and ``stuck_at`` is what it used.
+    #:
+    #: Worth surfacing when ``repaired``: the repair briefly runs the pump and
+    #: moves the setpoint to ``CLEAN_TEMP_F``, which is otherwise unexplained in
+    #: a consumer's history.
     STUCK_SETPOINT_DETECTED = "stuck_setpoint_detected"
     #: Every duration in :data:`CLEAN_TOGGLE_SECONDS` has been tried, one per
     #: stuck power-off, and the device keeps substituting the setpoint, so the

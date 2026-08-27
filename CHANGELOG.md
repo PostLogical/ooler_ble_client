@@ -4,6 +4,22 @@
 
 Field-trial fixes from the first real detect-repair-recover cycle on hardware.
 
+### Changed
+- **A completed deep clean is now repaired at once, rather than waiting for the
+  bug to bite.** A clean run to completion is known to arm it, and after the
+  restore-the-user's-setpoint fix below the first revert is invisible -- the
+  firmware puts back the pre-clean setpoint, which is what the user wanted -- so
+  the bug does not surface until their next temperature change. Waiting
+  therefore costs a setting. A 3s pump cycle immediately after a 45-minute clean
+  is also about the least surprising moment for one.
+
+  The observed-symptom watch is unchanged and remains the guarantee: `CLEAN` is
+  polled rather than notified, so a clean can be missed, and nothing breaks when
+  it is.
+- `STUCK_SETPOINT_DETECTED` detail gains `trigger`, either `"clean_completed"`
+  (repaired pre-emptively; `stuck_at` is `None`) or `"observed"` (the device was
+  caught substituting; `stuck_at` is the value it used).
+
 ### Fixed
 - **The repair restored the clean's forced temperature instead of the user's.**
   A deep clean holds the setpoint at `CLEAN_TEMP_F` (75) for its duration, and

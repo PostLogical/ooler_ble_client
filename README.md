@@ -99,7 +99,7 @@ Dataclass with fields: `power`, `mode`, `set_temperature`, `actual_temperature`,
 
 - `ConnectionEvent` -- a connectivity event with `type`, `timestamp`, and optional `detail`
 - `ConnectionEventType` -- enum: `CONNECTED`, `DISCONNECTED`, `SUBSCRIPTION_MISMATCH`, `SUBSCRIPTION_RECOVERED`, `FORCED_RECONNECT`, `STUCK_SETPOINT_DETECTED`, `STUCK_SETPOINT_UNFIXABLE`, `STUCK_SETPOINT_RECOVERED`
-  - `STUCK_SETPOINT_DETECTED` -- detail `{"wanted": int, "stuck_at": int, "repaired": bool}`. The device replaced the setpoint; `repaired` says whether the client acted. When true the repair briefly ran the pump and moved the setpoint, so surfacing this keeps that from looking like a glitch.
+  - `STUCK_SETPOINT_DETECTED` -- detail `{"trigger": str, "wanted": int, "stuck_at": int | None, "repaired": bool}`. `trigger` is `"clean_completed"` (a clean finished, which arms the bug; repaired pre-emptively, `stuck_at` is `None`) or `"observed"` (the device was caught substituting). `repaired` says whether the client acted. When true the repair briefly ran the pump and moved the setpoint, so surfacing this keeps that from looking like a glitch.
   - `STUCK_SETPOINT_UNFIXABLE` -- detail `{"consecutive": int}`. Every clean duration was tried and none held; the setpoint really is being discarded and nothing will correct it. Re-fires on each subsequent stuck power-off, so raising the same issue repeatedly is idempotent.
   - `STUCK_SETPOINT_RECOVERED` -- detail `{"after": int}`. A setpoint survived a full window off after an earlier repair. Fires on the transition only, so anything raised on `STUCK_SETPOINT_UNFIXABLE` has an edge to clear on. Note it also follows an ordinary successful repair about a watch window later, so the healthy path is `DETECTED{repaired: True}` then `RECOVERED{after: 1}` -- treat clearing as idempotent. It stays quiet when the observation could not have shown a failure, i.e. when the setpoint already equals the value the device substitutes.
 
@@ -172,9 +172,10 @@ This was reproduced in both directions on two devices, armed once through Home A
 
 By default the client handles it without any work from the consumer:
 
-1. Every power-off starts a watch.
-2. A setpoint change while the device stays off can only be the device's own doing -- it drops writes while off, and its single-connection limit means nothing else can be writing.
-3. The repair is applied, the setpoint the user asked for is restored, and `STUCK_SETPOINT_DETECTED` is emitted with `repaired: True`.
+1. A completed deep clean is repaired at once, since it is known to arm the bug.
+2. Otherwise, every power-off starts a watch.
+3. A setpoint change while the device stays off can only be the device's own doing -- it drops writes while off, and its single-connection limit means nothing else can be writing.
+4. The repair is applied, the setpoint the user asked for is restored, and `STUCK_SETPOINT_DETECTED` is emitted with `repaired: True`.
 
 Repairs back off rather than repeating a duration that just failed: `CLEAN_TOGGLE_SECONDS` is `(3.0, 10.0, 30.0)` and each attempt takes the next entry. Running out emits `STUCK_SETPOINT_UNFIXABLE` and stops, rather than running the pump after every power-off forever.
 
