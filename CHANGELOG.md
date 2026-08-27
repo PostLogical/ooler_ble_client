@@ -25,6 +25,14 @@ Field-trial fixes from the first real detect-repair-recover cycle on hardware.
   saw an entity stay stale for 36s until something else polled. The repair now
   fires state callbacks when it finishes.
 
+- **`STUCK_SETPOINT_RECOVERED` could claim an unverified fix.** After the
+  post-clean repair the setpoint equals the value the device substitutes (they
+  are the same number by construction on that path), so a repair that did not
+  take would have left exactly that value and the confirmation window could not
+  tell success from failure. It now stays quiet when the observation was
+  incapable of showing a failure; the next power-off at a different setpoint
+  settles it.
+
 ### Notes
 - The field trial also confirmed what the firmware commits: the **pre-clean**
   setpoint (85), not the clean's forced 75 and not a sentinel. And the 3s tier

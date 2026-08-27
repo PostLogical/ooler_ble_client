@@ -136,6 +136,10 @@ class OolerBLEDevice:
         # device currently reports. A clean forces the setpoint to CLEAN_TEMP_F
         # for its duration, so the reported value is not a safe thing to restore.
         self._commanded_setpoint: int | None = None
+        # The value the device last substituted. A watch that ends with the
+        # setpoint sitting on this value proves nothing, since a repair that did
+        # not take would have put the same number there.
+        self._last_stuck_at: int | None = None
         # Stuck-setpoint repair; see _watch_for_stuck_setpoint.
         self._stuck_setpoint_task: asyncio.Task[None] | None = None
         self._stuck_setpoint_repairs: int = 0
@@ -878,9 +882,17 @@ class OolerBLEDevice:
                 if self._monotonic() > deadline:
                     # Setpoint survived a full window off, so any earlier
                     # repair took: the device is behaving again.
+                    if baseline == self._last_stuck_at:
+                        # Except here: the setpoint already equals what the
+                        # device substitutes, so a repair that failed would
+                        # have left exactly this. Nothing was proved, so do not
+                        # claim recovery. The next power-off at a different
+                        # setpoint settles it.
+                        return
                     if self._stuck_setpoint_repairs:
                         after = self._stuck_setpoint_repairs
                         self._stuck_setpoint_repairs = 0
+                        self._last_stuck_at = None
                         self._fire_connection_event(
                             ConnectionEventType.STUCK_SETPOINT_RECOVERED,
                             {"after": after},
@@ -893,6 +905,7 @@ class OolerBLEDevice:
                 # the next power-off will catch it.
                 return
             stuck_at = self._state.set_temperature
+            self._last_stuck_at = stuck_at
             if not self._auto_clear_stuck_setpoint_bug:
                 # Told not to act, so report and stop. The failure count must
                 # not climb here: it records repairs that did not hold, and

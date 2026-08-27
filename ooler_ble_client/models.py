@@ -56,6 +56,11 @@ class ConnectionEventType(Enum):
     #: user-facing on :attr:`STUCK_SETPOINT_UNFIXABLE` has an edge to clear it
     #: on. ``detail`` carries ``after`` (repairs it took).
     #:
+    #: Only fires when the observation was capable of showing a failure: if the
+    #: setpoint already equals the value the device substitutes, a repair that
+    #: did not take would have left exactly that, so nothing is claimed and the
+    #: next power-off at a different setpoint settles it.
+    #:
     #: Note this also follows an ordinary successful repair, roughly one watch
     #: window later: the repair ends by powering the device back off, which
     #: starts a fresh watch that then survives. So the healthy path is

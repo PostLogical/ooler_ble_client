@@ -2437,3 +2437,38 @@ class TestStuckSetpointBug:
             await device.clear_stuck_setpoint_bug(setpoint=62)
         assert states and states[-1].power is False
         assert states[-1].set_temperature == 62
+
+    @pytest.mark.asyncio
+    async def test_no_recovery_claim_when_nothing_could_have_been_observed(self) -> None:
+        """After the post-clean repair the setpoint equals the value the device
+        substitutes, so a repair that failed would have left exactly the same
+        number. Claiming recovery there would be asserting an unverified fix."""
+        device, _client = _make_connected_device(power=False)
+        device._state.set_temperature = 85
+        device._last_stuck_at = 85
+        device._stuck_setpoint_repairs = 1
+        events: list[ConnectionEvent] = []
+        device.register_connection_event_callback(events.append)
+
+        with _window_already_expired(), patch("asyncio.sleep", AsyncMock()):
+            await device._watch_for_stuck_setpoint()
+
+        assert events == []
+        assert device._stuck_setpoint_repairs == 1
+
+    @pytest.mark.asyncio
+    async def test_recovery_is_claimed_once_a_failure_would_have_shown(self) -> None:
+        device, _client = _make_connected_device(power=False)
+        device._state.set_temperature = 62      # differs from what it substitutes
+        device._last_stuck_at = 85
+        device._stuck_setpoint_repairs = 1
+        events: list[ConnectionEvent] = []
+        device.register_connection_event_callback(events.append)
+
+        with _window_already_expired(), patch("asyncio.sleep", AsyncMock()):
+            await device._watch_for_stuck_setpoint()
+
+        assert [e.type for e in events] == [
+            ConnectionEventType.STUCK_SETPOINT_RECOVERED
+        ]
+        assert device._last_stuck_at is None
