@@ -42,16 +42,25 @@ class ConnectionEventType(Enum):
     #: ``repaired``: the repair briefly runs the pump and moves the setpoint,
     #: which is otherwise unexplained in a consumer's history.
     STUCK_SETPOINT_DETECTED = "stuck_setpoint_detected"
-    #: The repair has been applied :data:`MAX_STUCK_SETPOINT_REPAIRS` times in a
-    #: row and the device keeps substituting the setpoint, so the client has
-    #: stopped trying. It keeps watching and will resume if the device settles.
-    #: ``detail`` carries ``consecutive``.
+    #: Every duration in :data:`CLEAN_TOGGLE_SECONDS` has been tried, one per
+    #: stuck power-off, and the device keeps substituting the setpoint, so the
+    #: client has stopped trying. It keeps watching and will resume if the
+    #: device settles. Re-fires on each subsequent stuck power-off, so raising
+    #: the same issue repeatedly is idempotent. ``detail`` carries
+    #: ``consecutive`` (repairs that did not hold, so equal to the number of
+    #: durations available).
     STUCK_SETPOINT_UNFIXABLE = "stuck_setpoint_unfixable"
     #: A setpoint survived a full watch window with the device off after an
     #: earlier repair, so the device is behaving again. Fires on the transition
     #: only, not on every healthy power-off, so a consumer that raised something
     #: user-facing on :attr:`STUCK_SETPOINT_UNFIXABLE` has an edge to clear it
     #: on. ``detail`` carries ``after`` (repairs it took).
+    #:
+    #: Note this also follows an ordinary successful repair, roughly one watch
+    #: window later: the repair ends by powering the device back off, which
+    #: starts a fresh watch that then survives. So the healthy path is
+    #: ``DETECTED{repaired: True}`` then ``RECOVERED{after: 1}``. Treat clearing
+    #: as idempotent -- it is a no-op when nothing was raised.
     STUCK_SETPOINT_RECOVERED = "stuck_setpoint_recovered"
 
 

@@ -155,7 +155,8 @@ STUCK_SETPOINT_WATCH_SECONDS = 120.0
 #
 # The device reports clean mode within ~2s (CLEAN=1, SET_TEMP=CLEAN_TEMP_F), and
 # whether clearing needs any dwell beyond the CLEAN 1->0 transition is unknown.
-# 20s is the only duration proven by hand. So try the cheap value first and back
+# 3s is confirmed on hardware and 20s by hand; the rest is headroom. Try the
+# cheap value first and back
 # off: a repair that does nothing is invisible except that the setpoint is
 # replaced again on the next power-off, which is exactly when the next attempt
 # fires. Running out of entries means giving up (STUCK_SETPOINT_UNFIXABLE)

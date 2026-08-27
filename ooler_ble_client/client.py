@@ -826,8 +826,8 @@ class OolerBLEDevice:
         state it found. Harmless on an unaffected device.
 
         ``seconds`` is how long to leave the clean running; it defaults to the
-        longest, most-proven entry in :data:`CLEAN_TOGGLE_SECONDS`, since a
-        deliberate call should favour working over finishing quickly.
+        longest entry in :data:`CLEAN_TOGGLE_SECONDS`, since a deliberate call
+        should favour working over finishing quickly.
         """
         was_off = not self._state.power
         await self.set_clean(True)
@@ -890,7 +890,6 @@ class OolerBLEDevice:
                 )
                 return
             attempt = self._stuck_setpoint_repairs
-            self._stuck_setpoint_repairs += 1
             if attempt >= len(CLEAN_TOGGLE_SECONDS):
                 # Every duration has been tried and none held. Keep watching, but
                 # stop running the pump after every power-off to no effect.
@@ -904,10 +903,13 @@ class OolerBLEDevice:
                 )
                 self._fire_connection_event(
                     ConnectionEventType.STUCK_SETPOINT_UNFIXABLE,
-                    {"consecutive": self._stuck_setpoint_repairs},
+                    {"consecutive": attempt},
                 )
                 return
-            # Back off rather than repeating a duration that just failed.
+            # Back off rather than repeating a duration that just failed. Count
+            # the attempt only here, so the counter stays "repairs that did not
+            # hold" rather than drifting into "times we noticed".
+            self._stuck_setpoint_repairs = attempt + 1
             seconds = CLEAN_TOGGLE_SECONDS[attempt]
             _LOGGER.info(
                 "%s: Device replaced setpoint %s with %s while off; repairing "

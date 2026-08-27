@@ -2278,7 +2278,16 @@ class TestStuckSetpointBug:
             [ConnectionEventType.STUCK_SETPOINT_DETECTED] * len(CLEAN_TOGGLE_SECONDS)
             + [ConnectionEventType.STUCK_SETPOINT_UNFIXABLE]
         )
-        assert events[-1].detail == {"consecutive": len(CLEAN_TOGGLE_SECONDS) + 1}
+        # Reports the durations actually tried, and does not keep climbing on
+        # further stuck power-offs where no repair is attempted.
+        assert events[-1].detail == {"consecutive": len(CLEAN_TOGGLE_SECONDS)}
+        assert device._stuck_setpoint_repairs == len(CLEAN_TOGGLE_SECONDS)
+
+        device._state.set_temperature = 62
+        with patch("asyncio.sleep", AsyncMock(side_effect=_device_substitutes)):
+            await device._watch_for_stuck_setpoint()
+        assert events[-1].detail == {"consecutive": len(CLEAN_TOGGLE_SECONDS)}
+        assert device._stuck_setpoint_repairs == len(CLEAN_TOGGLE_SECONDS)
 
     @pytest.mark.asyncio
     async def test_quick_power_cycle_does_not_reset_failure_count(self) -> None:
