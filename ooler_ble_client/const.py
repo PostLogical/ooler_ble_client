@@ -56,8 +56,9 @@ RELATIVE_HUMIDITY_CHAR = "654b8162-7090-4084-8d94-4eb33e917e9c"  # read/notify; 
 AMBIENT_TEMPERATURE_F_CHAR = "7c0ea228-2616-4765-a726-beb5f4a0fa71"  # read/notify; always F
 # Unknown purpose; read/notify. Never changed across all testing (always 00 00).
 UNKNOWN_F30D_CHAR = "f30d875a-7297-43ac-9f5b-1d7eed4446eb"
-# Unknown purpose; read/notify. Was 0xFF on a device exhibiting an 80°F revert
-# bug, 0xFE on the other. Changed to 0x00 during testing; revert may have stopped.
+# Unknown purpose; read/notify only. Fluctuates between reads on an untouched
+# device (0x00/0xFE/0xFF observed April 2026, 0x0B/0x0C August 2026), so it is a
+# live value rather than a stored flag.
 UNKNOWN_9234_CHAR = "923445f2-9438-4d81-98c9-904b69b94eca"
 # Unknown purpose; read/notify. Always 0x00 across all testing.
 UNKNOWN_AF8D_CHAR = "af8d892b-693d-495d-ac95-eb849a5ac40c"
@@ -81,7 +82,15 @@ LIFETIME_CHAR = "5d30781f-1d06-4790-bbb8-5e1d7da96383"  # read; 4-byte LE counte
 RUNTIME_CHAR = "1a5c6dae-34de-4265-9fa6-0a59f7f683ee"  # read; 4-byte LE counter
 UV_RUNTIME_CHAR = "0ab6ff00-8d1b-475e-bcfa-ed3467f1f890"  # read; 4-byte LE counter
 DEVICE_LOGS_CHAR = "e6a505a4-9f0b-4755-b234-13243240da23"  # read; rolling event log
-SUB_FIRMWARE_CHAR = "9a5f99ef-4370-4e87-a073-7769cd8dd35c"  # read; e.g. "1.58"
+# ASCII decimal string, e.g. "1.79". PURPOSE UNKNOWN -- do not assume it is a
+# firmware version just because it sits in the diagnostics service and looks like one.
+# Observed 2026-08-26: advanced 1.65 -> 1.66 on device 603 during a ~7 minute window
+# containing one power cycle and one abrupt unplug, while device 601 (plugged in,
+# idle) did not move at all. It held constant at 1.58/1.53 across a full day of
+# April logging. A runtime-proportional model was tried and falsified: RUNTIME and
+# LIFETIME both DECREASE across an abrupt power loss (603 lost 6,353 and 9,182
+# respectively), so they are not monotonic and cannot support that inference.
+UNKNOWN_9A5F_CHAR = "9a5f99ef-4370-4e87-a073-7769cd8dd35c"  # read; e.g. "1.79"
 # Unknown purpose; read/notify. Always 0x00 across all testing.
 UNKNOWN_51B9_CHAR = "51b91d16-ff96-459d-aa02-0895044be049"
 # Unknown purpose; read/write. Constant 0x0000003C (60). Possibly a timeout in seconds.
@@ -115,3 +124,57 @@ SCHEDULE_META_CHAR = "fa242bc0-bf85-41f7-8dbb-53ba2e8b08a3"  # read-only; firmwa
 # -- OTA/unknown service (4d44eb61-87dd-402c-ad4c-41928e08c8eb) --
 # Standard BLE Central Address Resolution characteristic, repurposed or vestigial.
 UNKNOWN_2AAA_CHAR = "00002aaa-0000-1000-8000-00805f9b34fb"  # read/write/notify; always 0x0000
+
+# ---------------------------------------------------------------------------
+# Setpoint-restore ("magic temperature") behaviour -- firmware 15.20
+# ---------------------------------------------------------------------------
+#
+# A deep clean run TO COMPLETION commits the device's current setpoint into
+# non-volatile storage and enables restore-on-power-off: from then on, whenever
+# the unit is powered off, SET_TEMP snaps back to that stored value after a
+# delay. The delay is highly variable -- 3s to 60s observed -- so any check for
+# this behaviour needs a window of minutes, not seconds.
+#
+# Starting a clean and CANCELLING it before it completes clears the behaviour.
+# CLEAN=1 forces SET_TEMP to CLEAN_TEMP_F; CLEAN=0 restores from the stored slot
+# and leaves it tracking live values again.
+#
+# A completed clean can never fix what it causes: completion ends by powering
+# the device off, so CLEAN=0 is never sent and the restore path never runs.
+#
+# Reproduced in both directions on two devices (2026-08-26), armed via Home
+# Assistant on one and the official app on the other, so this is device
+# firmware and not a client behaviour.
+CLEAN_TEMP_F = 75
+
+# How long after a power-off to watch for the restore before concluding the
+# device is not armed. Longest observed delay was 60s; this is double that.
+STUCK_SETPOINT_WATCH_SECONDS = 120.0
+
+# How many repairs that FAILED TO STICK to tolerate before giving up. Only
+# repairs with no completed deep clean in between count: a clean re-arms the
+# device legitimately, so repairing after one is expected, not a failure. What
+# this catches is a repair that does nothing -- e.g. CLEAN_TOGGLE_SECONDS being
+# too short for a given device -- which would otherwise run the pump after every
+# power-off forever.
+MAX_STUCK_SETPOINT_REPAIRS = 3
+
+# How long to leave the clean running before cancelling it. The device reports
+# clean mode within ~2s (CLEAN=1, SET_TEMP=CLEAN_TEMP_F); shorter values are
+# untested. The known-good value from manual testing was 20s.
+CLEAN_TOGGLE_SECONDS = 3.0
+
+# DEVICE_LOGS is a paging ring buffer of 6-byte records:
+#   (code: u8, param: u8, ts: int32 LE)  where ts is AGE IN SECONDS at read time.
+# Repeated reads page backwards through history until an empty read. Reading
+# DRAINS the log -- the official app reads it too, so do not poll it routinely.
+# Confirmed opcodes:
+#   0x14  setpoint change (param = degrees F)
+#   0x01  power   (moves together with 0x12)
+#   0x12  power   (moves together with 0x01)
+#   0x19  clean flag (1 = started, 0 = cancelled)
+#   0x07  emitted at clean cancel, alongside 0x19=0
+#   0x0b/0x1e/0x1f  20-minute telemetry triplet, not events (0x1e = ambient temp)
+# A 0x19=1 record with no following 0x19=0 / 0x07=0 pair is a clean that ran to
+# completion -- i.e. the device is stuck. Documented for debugging; the client
+# does not read the log, because reading it destroys it.
