@@ -33,6 +33,19 @@ class ConnectionEventType(Enum):
     SUBSCRIPTION_MISMATCH = "subscription_mismatch"
     SUBSCRIPTION_RECOVERED = "subscription_recovered"
     FORCED_RECONNECT = "forced_reconnect"
+    #: The device was caught replacing the setpoint on its own after being
+    #: powered off, and has been repaired -- see
+    #: :meth:`OolerBLEDevice.clear_stuck_setpoint_bug`. Emitted because the
+    #: repair briefly runs the pump and moves the setpoint, which is otherwise
+    #: unexplained in a consumer's history. ``detail`` carries ``wanted`` (the
+    #: setpoint before the device interfered) and ``stuck_at`` (what it
+    #: substituted).
+    STUCK_SETPOINT_REPAIRED = "stuck_setpoint_repaired"
+    #: The repair has been applied :data:`MAX_STUCK_SETPOINT_REPAIRS` times in a
+    #: row and the device keeps substituting the setpoint, so the client has
+    #: stopped trying. It keeps watching and will resume if the device settles.
+    #: ``detail`` carries ``consecutive``.
+    STUCK_SETPOINT_UNFIXABLE = "stuck_setpoint_unfixable"
 
 
 @dataclass(frozen=True)

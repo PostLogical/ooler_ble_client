@@ -32,9 +32,12 @@ from .const import (
     POWER_CHAR,
     MODE_CHAR,
     SETTEMP_CHAR,
+    STUCK_SETPOINT_WATCH_SECONDS,
     ACTUALTEMP_CHAR,
     WATER_LEVEL_CHAR,
     CLEAN_CHAR,
+    CLEAN_TOGGLE_SECONDS,
+    MAX_STUCK_SETPOINT_REPAIRS,
     DISPLAY_TEMPERATURE_UNIT_CHAR,
     SCHEDULE_HEADER_CHAR,
     SCHEDULE_TIMES_CHAR,
@@ -97,9 +100,16 @@ def _is_valid_temp_f(temp_f: int) -> bool:
 
 class OolerBLEDevice:
 
-    def __init__(self, model: str) -> None:
-        """Initialize the OolerBLEDevice."""
+    def __init__(self, model: str, auto_clear_stuck_setpoint_bug: bool = True) -> None:
+        """Initialize the OolerBLEDevice.
+
+        ``auto_clear_stuck_setpoint_bug`` controls whether the client repairs a
+        device it catches substituting its own setpoint after being powered
+        off; see :meth:`clear_stuck_setpoint_bug`. Pass ``False`` to be told
+        about it instead and handle it yourself.
+        """
         self._model_id = model
+        self._auto_clear_stuck_setpoint_bug = auto_clear_stuck_setpoint_bug
         self._state = OolerBLEState()
         self._connect_lock = asyncio.Lock()
         self._client: BleakClientWithServiceCache | None = None
@@ -123,6 +133,9 @@ class OolerBLEDevice:
         # Indirection so tests can inject a fake monotonic clock without
         # globally patching time.monotonic.
         self._monotonic: Callable[[], float] = time.monotonic
+        # Stuck-setpoint repair; see _watch_for_stuck_setpoint.
+        self._stuck_setpoint_task: asyncio.Task[None] | None = None
+        self._stuck_setpoint_repairs: int = 0
 
     def set_ble_device(self, ble_device: BLEDevice) -> None:
         """Set the BLE Device."""
@@ -361,6 +374,13 @@ class OolerBLEDevice:
                 if not power and self._state.clean:
                     self._state.clean = False
                     changed = True
+                if not power and (
+                    self._stuck_setpoint_task is None
+                    or self._stuck_setpoint_task.done()
+                ):
+                    self._stuck_setpoint_task = asyncio.create_task(
+                        self._watch_for_stuck_setpoint()
+                    )
             elif uuid == MODE_CHAR:
                 mode_int = int.from_bytes(data, "little")
                 if 0 <= mode_int < len(MODE_INT_TO_MODE_STATE):
@@ -771,17 +791,109 @@ class OolerBLEDevice:
         self._state.set_temperature = settemp_int
 
     async def set_clean(self, clean: bool) -> None:
-        """Start or stop a clean cycle. Automatically powers on the device."""
+        """Start or stop a clean cycle. Starting one powers the device on."""
         if self._client is None:
             await self.connect()
         if self._client is None:
             raise RuntimeError("Failed to connect to device")
-        # Power on first — clean requires the device to be running.
+        # Starting a clean requires the device to be running. Stopping one does
+        # not: the device drops writes while off, so rather than waking it to
+        # land a write it will ignore, skip it — as set_temperature_unit does.
         if not self._state.power:
-            await self.set_power(True)
+            if clean:
+                await self.set_power(True)
+            else:
+                _LOGGER.warning("Device is off; clean cannot be stopped.")
+                self._state.clean = False
+                return
         await self._write_gatt(CLEAN_CHAR, int(clean).to_bytes(1, "little"))
         _LOGGER.debug("Set clean to %s.", clean)
         self._state.clean = clean
+
+    async def clear_stuck_setpoint_bug(self, setpoint: int | None = None) -> None:
+        """Work around the firmware bug that makes the setpoint snap back.
+
+        A deep clean run to completion leaves the device substituting a stored
+        temperature every time it is powered off, so anything set afterwards is
+        silently discarded. Starting a clean and cancelling it clears that; a
+        clean left to finish never can, because it ends by powering the device
+        off and so never sends ``CLEAN=0``. See CLEAN_TEMP_F in const.py.
+
+        Pass ``setpoint`` to leave the device at a particular temperature —
+        the device is already powered on at this point, so it is written for
+        real rather than deferred to the next power-on. Restores the power
+        state it found. Harmless on an unaffected device.
+        """
+        was_off = not self._state.power
+        await self.set_clean(True)
+        await asyncio.sleep(CLEAN_TOGGLE_SECONDS)
+        await self.set_clean(False)
+        if setpoint is not None:
+            await self.set_temperature(setpoint)
+        if was_off:
+            await self.set_power(False)
+
+    async def _watch_for_stuck_setpoint(self) -> None:
+        """After a power-off, repair the device if it moves the setpoint itself.
+
+        A setpoint change while the device stays off can only be the device's
+        own doing: it drops writes while off, and its single-connection limit
+        means nothing else can be writing while we hold the link. The delay is
+        variable — 3s to 60s observed — hence the generous window.
+        """
+        wanted = self._state.set_temperature
+        deadline = self._monotonic() + STUCK_SETPOINT_WATCH_SECONDS
+        try:
+            while self._state.set_temperature == wanted:
+                if self._state.power:
+                    # Back in use before anything happened. Proves nothing
+                    # either way, so leave the failure count alone.
+                    return
+                if self._monotonic() > deadline:
+                    # Setpoint survived a full window off, so any earlier
+                    # repair took: the device is behaving again.
+                    self._stuck_setpoint_repairs = 0
+                    return
+                await asyncio.sleep(1)
+            if self._state.power:
+                # Powered back on as the device replaced the setpoint. Repairing
+                # now would start a clean cycle on a device someone is using;
+                # the next power-off will catch it.
+                return
+            stuck_at = self._state.set_temperature
+            self._stuck_setpoint_repairs += 1
+            if self._stuck_setpoint_repairs > MAX_STUCK_SETPOINT_REPAIRS:
+                # Repairing is not sticking. Keep watching, but stop running the
+                # pump after every power-off to no effect.
+                _LOGGER.warning(
+                    "%s: Setpoint still being replaced (%s -> %s) after %d repairs; "
+                    "giving up until it settles.",
+                    self._model_id,
+                    wanted,
+                    stuck_at,
+                    MAX_STUCK_SETPOINT_REPAIRS,
+                )
+                self._fire_connection_event(
+                    ConnectionEventType.STUCK_SETPOINT_UNFIXABLE,
+                    {"consecutive": self._stuck_setpoint_repairs},
+                )
+                return
+            _LOGGER.info(
+                "%s: Device replaced setpoint %s with %s while off; repairing.",
+                self._model_id,
+                wanted,
+                stuck_at,
+            )
+            if self._auto_clear_stuck_setpoint_bug:
+                await self.clear_stuck_setpoint_bug(setpoint=wanted)
+            self._fire_connection_event(
+                ConnectionEventType.STUCK_SETPOINT_REPAIRED,
+                {"wanted": wanted, "stuck_at": stuck_at},
+            )
+        except Exception as err:  # noqa: BLE001 - background task, nothing to raise to
+            _LOGGER.warning(
+                "%s: Failed to clear the stuck-setpoint bug: %s", self._model_id, err
+            )
 
     async def set_temperature_unit(self, unit: TemperatureUnit) -> None:
         """Set device display unit: 'C' or 'F'.
@@ -999,6 +1111,11 @@ class OolerBLEDevice:
 
     async def _execute_disconnect(self) -> None:
         """Execute disconnection."""
+        if self._stuck_setpoint_task is not None:
+            # Outlives the connection otherwise: it waits minutes for the
+            # device to move the setpoint, and repairing needs the link.
+            self._stuck_setpoint_task.cancel()
+            self._stuck_setpoint_task = None
         async with self._connect_lock:
             client = self._client
             self._expected_disconnect = True

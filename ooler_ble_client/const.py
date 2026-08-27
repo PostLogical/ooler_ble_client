@@ -151,12 +151,13 @@ CLEAN_TEMP_F = 75
 # device is not armed. Longest observed delay was 60s; this is double that.
 STUCK_SETPOINT_WATCH_SECONDS = 120.0
 
-# How many repairs that FAILED TO STICK to tolerate before giving up. Only
-# repairs with no completed deep clean in between count: a clean re-arms the
-# device legitimately, so repairing after one is expected, not a failure. What
-# this catches is a repair that does nothing -- e.g. CLEAN_TOGGLE_SECONDS being
-# too short for a given device -- which would otherwise run the pump after every
-# power-off forever.
+# Consecutive power-offs needing repair before giving up. Reset by any power-off
+# where the setpoint survives the full watch window, which is the only real
+# evidence a repair took. Catches a repair that does nothing -- CLEAN_TOGGLE_
+# SECONDS being too short for a device, say -- which would otherwise run the pump
+# after every power-off forever. Running several deep cleans back to back with no
+# ordinary use in between could trip it, since each legitimately re-arms the
+# device; it self-heals on the next normal power-off.
 MAX_STUCK_SETPOINT_REPAIRS = 3
 
 # How long to leave the clean running before cancelling it. The device reports
