@@ -181,6 +181,15 @@ Repairs back off rather than repeating a duration that just failed: `CLEAN_TOGGL
 
 Note the revert delay is highly variable -- 3s to 60s observed -- so any manual check needs minutes, not seconds.
 
+**Known gap:** a clean that completes while nothing is connected is not repaired
+pre-emptively, because the client never sees the power-off that ends it. This is
+reachable with nobody present -- a clean can be started at the unit's own buttons
+with no BLE client attached, and connections drop on their own. The device stays
+stuck until something connects and the symptom appears on a later power-off, at
+which point the watch repairs it as normal. The consequence is a delayed repair,
+not a missed one. Detecting it on connect would mean reading `DEVICE_LOGS`, which
+destroys the log the official app also reads, so the client does not.
+
 ## License
 
 Apache-2.0
