@@ -132,6 +132,10 @@ class OolerBLEDevice:
         # Indirection so tests can inject a fake monotonic clock without
         # globally patching time.monotonic.
         self._monotonic: Callable[[], float] = time.monotonic
+        # The setpoint the user actually asked for, as opposed to whatever the
+        # device currently reports. A clean forces the setpoint to CLEAN_TEMP_F
+        # for its duration, so the reported value is not a safe thing to restore.
+        self._commanded_setpoint: int | None = None
         # Stuck-setpoint repair; see _watch_for_stuck_setpoint.
         self._stuck_setpoint_task: asyncio.Task[None] | None = None
         self._stuck_setpoint_repairs: int = 0
@@ -403,6 +407,10 @@ class OolerBLEDevice:
                 if self._state.set_temperature != set_temperature:
                     self._state.set_temperature = set_temperature
                     changed = True
+                    if self._state.power and not self._state.clean:
+                        # Someone asked for this: the device only changes the
+                        # setpoint by itself while cleaning or while off.
+                        self._commanded_setpoint = set_temperature
             elif uuid == ACTUALTEMP_CHAR:
                 actualtemp_int = int.from_bytes(data, "little")
                 if self._state.actual_temperature != actualtemp_int:
@@ -788,6 +796,7 @@ class OolerBLEDevice:
             "Set temperature to %s (wrote %s°F to device).", settemp_int, settemp_f
         )
         self._state.set_temperature = settemp_int
+        self._commanded_setpoint = settemp_int
 
     async def set_clean(self, clean: bool) -> None:
         """Start or stop a clean cycle. Starting one powers the device on."""
@@ -837,6 +846,9 @@ class OolerBLEDevice:
             await self.set_temperature(setpoint)
         if was_off:
             await self.set_power(False)
+        # Nobody asked for any of this, and the setters update state without
+        # notifying, so tell consumers where the device ended up.
+        self._fire_callbacks()
 
     async def _watch_for_stuck_setpoint(self) -> None:
         """After a power-off, repair the device if it moves the setpoint itself.
@@ -846,10 +858,19 @@ class OolerBLEDevice:
         means nothing else can be writing while we hold the link. The delay is
         variable — 3s to 60s observed — hence the generous window.
         """
-        wanted = self._state.set_temperature
+        # What the device reports now, used only to notice it changing.
+        baseline = self._state.set_temperature
+        # What to put back, which is not the same thing: on the power-off that
+        # ends a deep clean the reported value is the clean's forced
+        # CLEAN_TEMP_F, and restoring that would discard the user's setting.
+        wanted = (
+            baseline
+            if self._commanded_setpoint is None
+            else self._commanded_setpoint
+        )
         deadline = self._monotonic() + STUCK_SETPOINT_WATCH_SECONDS
         try:
-            while self._state.set_temperature == wanted:
+            while self._state.set_temperature == baseline:
                 if self._state.power:
                     # Back in use before anything happened. Proves nothing
                     # either way, so leave the failure count alone.

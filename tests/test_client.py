@@ -19,6 +19,7 @@ from ooler_ble_client import (
     OolerConnectionError,
 )
 from ooler_ble_client.const import (
+    CLEAN_TEMP_F,
     CLEAN_TOGGLE_SECONDS,
     MODE_INT_TO_MODE_STATE,
     POWER_CHAR,
@@ -2386,3 +2387,53 @@ class TestStuckSetpointBug:
             await device._watch_for_stuck_setpoint()
 
         assert events == []
+
+    @pytest.mark.asyncio
+    async def test_restores_the_users_setpoint_not_the_cleans_forced_one(self) -> None:
+        """Field trial 2026-08-27: user set 85, the clean forced 75, the
+        firmware reverted to 85, and the repair wrote 75 -- silently discarding
+        the setting. The clean's terminating power-off is both what arms the bug
+        and what triggers the first detection, so this is the path a real user
+        hits first."""
+        device, client = _make_connected_device(power=True)
+        await device.set_temperature(85)          # what the user asked for
+        device._state.clean = True
+        device._notification_handler(              # clean forces its own temp
+            _make_sender(SETTEMP_CHAR), bytearray(bytes([CLEAN_TEMP_F]))
+        )
+        assert device.state.set_temperature == CLEAN_TEMP_F
+        device._state.clean = False
+        device._state.power = False
+        events: list[ConnectionEvent] = []
+        device.register_connection_event_callback(events.append)
+
+        async def _firmware_reverts(_delay: float) -> None:
+            device._state.set_temperature = 85     # the pre-clean setpoint
+
+        with patch("asyncio.sleep", AsyncMock(side_effect=_firmware_reverts)):
+            await device._watch_for_stuck_setpoint()
+
+        assert events[0].detail == {"wanted": 85, "stuck_at": 85, "repaired": True}
+        assert device.state.set_temperature == 85
+
+    @pytest.mark.asyncio
+    async def test_externally_set_temperature_counts_as_the_users_intent(self) -> None:
+        """Changed at the unit or in the app while running -- ours to preserve."""
+        device, _client = _make_connected_device(power=True)
+        device._notification_handler(
+            _make_sender(SETTEMP_CHAR), bytearray(b"\x3e")  # 62
+        )
+        assert device._commanded_setpoint == 62
+
+    @pytest.mark.asyncio
+    async def test_repair_tells_consumers_where_the_device_ended_up(self) -> None:
+        """The repair powers the device on and off without being asked; the
+        setters update state silently, so without this a consumer's entity
+        stays stale until something else polls."""
+        device, _client = _make_connected_device(power=False)
+        states: list[OolerBLEState] = []
+        device.register_callback(states.append)
+        with patch("asyncio.sleep", AsyncMock()):
+            await device.clear_stuck_setpoint_bug(setpoint=62)
+        assert states and states[-1].power is False
+        assert states[-1].set_temperature == 62

@@ -1,5 +1,35 @@
 # Changelog
 
+## 1.1.0b2
+
+Field-trial fixes from the first real detect-repair-recover cycle on hardware.
+
+### Fixed
+- **The repair restored the clean's forced temperature instead of the user's.**
+  A deep clean holds the setpoint at `CLEAN_TEMP_F` (75) for its duration, and
+  the power-off that ends the clean is both what arms the bug and what triggers
+  the first detection -- so the last *reported* setpoint at that moment is the
+  clean's artifact, not anything the user chose. Field trial: user set 85, the
+  clean forced 75, the firmware reverted to 85, and the repair wrote 75 and
+  reported `repaired: True`. The user's setting was destroyed by the repair on
+  the path a real user hits first.
+
+  The client now tracks the setpoint that was actually asked for -- by
+  `set_temperature()`, or observed while the device is running and not cleaning
+  -- and restores that. Change detection still uses the reported value, since
+  those are two different jobs.
+- **Library-initiated changes were invisible to consumers.** The setters update
+  cached state optimistically, so the device's own notification finds nothing
+  changed and fires no callback. Consumers asking for a change refresh anyway,
+  but the repair changes power and setpoint without being asked; a field trial
+  saw an entity stay stale for 36s until something else polled. The repair now
+  fires state callbacks when it finishes.
+
+### Notes
+- The field trial also confirmed what the firmware commits: the **pre-clean**
+  setpoint (85), not the clean's forced 75 and not a sentinel. And the 3s tier
+  cleared it on the first attempt (3.14s toggle).
+
 ## 1.1.0b1
 
 Beta. The setpoint-restore repair has not yet been exercised against real
