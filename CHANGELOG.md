@@ -39,6 +39,32 @@ or skipping the write.
   be, so an error in between — now possible, since the setpoint restore can
   raise — would have left it running.
 
+### Diagnostics
+Temporary, and scheduled for removal once they have answered the question they
+were added for. Both are debug logging only: no value is parsed differently, no
+state is written, and nothing is filtered.
+
+- **Raw GATT responses are logged on every poll.** The post-connect read
+  intermittently reports placeholder values for the two sensor-derived
+  characteristics — `water_level` 0 on a full tank, `actual_temperature` 0x81
+  (129) — while the stored settings beside them read correctly. Only the parsed
+  state was ever logged, and `int.from_bytes` maps both an empty response and a
+  zero byte to 0, so the logs could not say which had arrived. A temperature of
+  129 rules out an empty response for that field; water level had no equivalent
+  witness.
+- **A settling probe re-reads water level and actual temperature 1s and 5s after
+  a connect**, logs what came back against what state holds, and discards the
+  values. The notified fields self-correct within ~0.4s when their first
+  notification lands, but water level is polled rather than subscribed, so its
+  placeholder survives until the next poll — up to five minutes. Nothing has
+  ever re-read it, so whether a re-read returns real data is unknown, and that is
+  what decides between re-reading and rejecting the placeholder value.
+
+  The probe runs only when debug logging is enabled, since its sole product is a
+  log line. It runs detached and after the `CONNECTED` event, so its sleeps
+  cannot delay a caller waiting on a connection, and it is cancelled on
+  disconnect.
+
 ## 1.1.0b7
 
 Supersedes all earlier 1.1.0 betas. Use this one.

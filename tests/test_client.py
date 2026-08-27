@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import random
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, suppress
@@ -754,6 +755,112 @@ class TestReadAllCharacteristics:
         client.read_gatt_char = AsyncMock(side_effect=_GATT_READS_F)
         state = await device._read_all_characteristics()
         assert state.temperature_unit == "F"
+
+
+class TestSettlingProbe:
+    """The temporary diagnostic for the placeholder initial read.
+
+    It exists to answer one question from field logs -- whether a re-read a
+    second after connect returns real data -- so what matters is that it
+    reports the raw bytes, costs nothing when nobody is collecting, and
+    cannot take a connection down.
+    """
+
+    @pytest.mark.asyncio
+    async def test_skipped_when_debug_logging_is_off(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        device, client = _make_connected_device()
+        client.read_gatt_char = AsyncMock()
+        caplog.set_level(logging.INFO, logger="ooler_ble_client")
+
+        await device._settling_probe(client)
+
+        client.read_gatt_char.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_samples_every_offset_and_reports_raw_bytes(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        device, client = _make_connected_device()
+        device._state.water_level = 0
+        device._state.actual_temperature = 129
+        # A device still placeholding at 1s and settled by 5s -- the
+        # sequence the probe exists to be able to tell apart.
+        client.read_gatt_char = AsyncMock(
+            side_effect=[b"\x00", b"\x81", b"\x64", b"\x45"]
+        )
+        caplog.set_level(logging.DEBUG, logger="ooler_ble_client")
+
+        with _patch_sleep():
+            await device._settling_probe(client)
+
+        assert "at 1.0s: water=00 actualtemp=81" in caplog.text
+        assert "at 5.0s: water=64 actualtemp=45" in caplog.text
+        # The probe reports; it must not correct state behind the fix's back.
+        assert device.state.water_level == 0
+        assert device.state.actual_temperature == 129
+
+    @pytest.mark.asyncio
+    async def test_reports_an_empty_response_distinguishably(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        device, client = _make_connected_device()
+        client.read_gatt_char = AsyncMock(side_effect=[b"", b"\x45", b"\x64", b"\x45"])
+        caplog.set_level(logging.DEBUG, logger="ooler_ble_client")
+
+        with _patch_sleep():
+            await device._settling_probe(client)
+
+        assert "water=<empty>" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_read_failure_ends_the_probe_quietly(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        device, client = _make_connected_device()
+        client.read_gatt_char = AsyncMock(side_effect=BleakError("gone"))
+        caplog.set_level(logging.DEBUG, logger="ooler_ble_client")
+
+        with _patch_sleep():
+            await device._settling_probe(client)
+
+        assert "Settling probe stopped at 1.0s" in caplog.text
+        # Stopped, not carried on to the next offset on a dead connection.
+        assert "at 5.0s" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_cancellation_is_not_swallowed(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The catch-all must not turn a cancel into a quiet return."""
+        device, client = _make_connected_device()
+        client.read_gatt_char = AsyncMock()
+        caplog.set_level(logging.DEBUG, logger="ooler_ble_client")
+
+        with patch(
+            "asyncio.sleep", new_callable=AsyncMock,
+            side_effect=asyncio.CancelledError,
+        ), pytest.raises(asyncio.CancelledError):
+            await device._settling_probe(client)
+
+    @pytest.mark.asyncio
+    async def test_disconnect_cancels_a_probe_still_sleeping(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        device, client = _make_connected_device()
+        caplog.set_level(logging.DEBUG, logger="ooler_ble_client")
+        task = asyncio.create_task(device._settling_probe(client))
+        await asyncio.sleep(0)  # let it reach the first sleep
+        device._settling_probe_task = task
+
+        await device._execute_disconnect()
+        with suppress(asyncio.CancelledError):
+            await task
+
+        assert task.cancelled()
+        assert device._settling_probe_task is None
+        client.read_gatt_char.assert_not_called()
 
 
 class TestAsyncPoll:
