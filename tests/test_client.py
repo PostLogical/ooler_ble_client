@@ -20,7 +20,7 @@ from ooler_ble_client import (
 )
 from ooler_ble_client.const import (
     STUCK_SETPOINT_WATCH_SECONDS,
-    MAX_STUCK_SETPOINT_REPAIRS,
+    CLEAN_TOGGLE_SECONDS,
     MODE_INT_TO_MODE_STATE,
     POWER_CHAR,
     MODE_CHAR,
@@ -2255,21 +2255,21 @@ class TestStuckSetpointBug:
 
         # Every power-off finds the setpoint replaced again: the repair is not
         # sticking, e.g. CLEAN_TOGGLE_SECONDS too short for this device.
-        for _ in range(MAX_STUCK_SETPOINT_REPAIRS + 1):
+        for _ in range(len(CLEAN_TOGGLE_SECONDS) + 1):
             device._state.set_temperature = 62
             with patch("asyncio.sleep", AsyncMock(side_effect=_device_substitutes)):
                 await device._watch_for_stuck_setpoint()
 
         assert [e.type for e in events] == (
-            [ConnectionEventType.STUCK_SETPOINT_REPAIRED] * MAX_STUCK_SETPOINT_REPAIRS
+            [ConnectionEventType.STUCK_SETPOINT_REPAIRED] * len(CLEAN_TOGGLE_SECONDS)
             + [ConnectionEventType.STUCK_SETPOINT_UNFIXABLE]
         )
-        assert events[-1].detail == {"consecutive": MAX_STUCK_SETPOINT_REPAIRS + 1}
+        assert events[-1].detail == {"consecutive": len(CLEAN_TOGGLE_SECONDS) + 1}
 
     @pytest.mark.asyncio
     async def test_a_clean_power_off_resets_the_give_up_counter(self) -> None:
         device, _client = _make_connected_device(power=False)
-        device._stuck_setpoint_repairs = MAX_STUCK_SETPOINT_REPAIRS
+        device._stuck_setpoint_repairs = len(CLEAN_TOGGLE_SECONDS)
         ticks = iter([0.0, STUCK_SETPOINT_WATCH_SECONDS + 1])
         device._monotonic = lambda: next(ticks)
         with patch("asyncio.sleep", AsyncMock()):
@@ -2311,3 +2311,38 @@ class TestStuckSetpointBug:
 
         assert events == []
         client.write_gatt_char.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_repair_backs_off_instead_of_repeating_a_failed_duration(self) -> None:
+        """Each attempt uses the next, longer clean duration -- repeating one
+        that just failed would waste the whole retry budget."""
+        device, _client = _make_connected_device(power=False)
+        used: list[float] = []
+
+        async def _record(**kwargs: object) -> None:
+            used.append(kwargs["seconds"])  # type: ignore[arg-type]
+
+        async def _device_substitutes(_delay: float) -> None:
+            device._state.set_temperature = 71
+
+        with patch.object(device, "clear_stuck_setpoint_bug", _record):
+            for _ in range(len(CLEAN_TOGGLE_SECONDS)):
+                device._state.set_temperature = 62
+                with patch(
+                    "asyncio.sleep", AsyncMock(side_effect=_device_substitutes)
+                ):
+                    await device._watch_for_stuck_setpoint()
+
+        assert used == list(CLEAN_TOGGLE_SECONDS)
+
+    @pytest.mark.asyncio
+    async def test_manual_repair_uses_the_most_proven_duration(self) -> None:
+        device, _client = _make_connected_device(power=True)
+        slept: list[float] = []
+
+        async def _record_sleep(delay: float) -> None:
+            slept.append(delay)
+
+        with patch("asyncio.sleep", _record_sleep):
+            await device.clear_stuck_setpoint_bug()
+        assert CLEAN_TOGGLE_SECONDS[-1] in slept

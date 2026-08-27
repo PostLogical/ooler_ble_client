@@ -22,9 +22,13 @@ hardware through the automatic path -- see Unverified below.
     single-connection limit means nothing else can be writing.
   - `ConnectionEventType.STUCK_SETPOINT_REPAIRED` -- detail carries `wanted` and
     `stuck_at`. Emitted so the brief pump run and setpoint blip are explained.
+  - Repairs back off rather than repeating a duration that just failed:
+    `CLEAN_TOGGLE_SECONDS` is a schedule, `(3.0, 10.0, 30.0)`, and each attempt
+    takes the next entry. Only 20s has been proven by hand, so the cheap value
+    is tried first and the proven range is the fallback.
   - `ConnectionEventType.STUCK_SETPOINT_UNFIXABLE` -- detail carries
-    `consecutive`. Emitted after `MAX_STUCK_SETPOINT_REPAIRS` repairs fail to
-    stick, at which point the client stops running the pump to no effect.
+    `consecutive`. Emitted once every duration has been tried and none held, at
+    which point the client stops running the pump to no effect.
   - `OolerBLEDevice(model, auto_clear_stuck_setpoint_bug=False)` disables the
     repair while leaving detection and events intact.
 - `diagnostics/capture.py` -- labelled snapshot of every Ooler in range, diffed
@@ -51,9 +55,9 @@ hardware through the automatic path -- see Unverified below.
   not read it; this is for debugging only.
 
 ### Unverified
-- `CLEAN_TOGGLE_SECONDS` is 3. The only value proven by hand is 20. If it is too
-  short the repair silently does nothing; `STUCK_SETPOINT_UNFIXABLE` bounds that
-  to three attempts rather than forever.
+- The shortest `CLEAN_TOGGLE_SECONDS` entries (3s, 10s) are untested; only 20s
+  has been proven by hand. A too-short toggle fails invisibly, so the schedule
+  backs off through 30s before giving up.
 - The automatic detect-and-repair path has not run against hardware. All
   hardware confirmation to date used manual toggles.
 - Repeated deep cleans with no ordinary use between them can trip the give-up

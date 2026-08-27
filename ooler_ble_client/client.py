@@ -37,7 +37,6 @@ from .const import (
     WATER_LEVEL_CHAR,
     CLEAN_CHAR,
     CLEAN_TOGGLE_SECONDS,
-    MAX_STUCK_SETPOINT_REPAIRS,
     DISPLAY_TEMPERATURE_UNIT_CHAR,
     SCHEDULE_HEADER_CHAR,
     SCHEDULE_TIMES_CHAR,
@@ -810,7 +809,9 @@ class OolerBLEDevice:
         _LOGGER.debug("Set clean to %s.", clean)
         self._state.clean = clean
 
-    async def clear_stuck_setpoint_bug(self, setpoint: int | None = None) -> None:
+    async def clear_stuck_setpoint_bug(
+        self, setpoint: int | None = None, seconds: float | None = None
+    ) -> None:
         """Work around the firmware bug that makes the setpoint snap back.
 
         A deep clean run to completion leaves the device substituting a stored
@@ -823,10 +824,14 @@ class OolerBLEDevice:
         the device is already powered on at this point, so it is written for
         real rather than deferred to the next power-on. Restores the power
         state it found. Harmless on an unaffected device.
+
+        ``seconds`` is how long to leave the clean running; it defaults to the
+        longest, most-proven entry in :data:`CLEAN_TOGGLE_SECONDS`, since a
+        deliberate call should favour working over finishing quickly.
         """
         was_off = not self._state.power
         await self.set_clean(True)
-        await asyncio.sleep(CLEAN_TOGGLE_SECONDS)
+        await asyncio.sleep(CLEAN_TOGGLE_SECONDS[-1] if seconds is None else seconds)
         await self.set_clean(False)
         if setpoint is not None:
             await self.set_temperature(setpoint)
@@ -861,31 +866,36 @@ class OolerBLEDevice:
                 # the next power-off will catch it.
                 return
             stuck_at = self._state.set_temperature
+            attempt = self._stuck_setpoint_repairs
             self._stuck_setpoint_repairs += 1
-            if self._stuck_setpoint_repairs > MAX_STUCK_SETPOINT_REPAIRS:
-                # Repairing is not sticking. Keep watching, but stop running the
-                # pump after every power-off to no effect.
+            if attempt >= len(CLEAN_TOGGLE_SECONDS):
+                # Every duration has been tried and none held. Keep watching, but
+                # stop running the pump after every power-off to no effect.
                 _LOGGER.warning(
-                    "%s: Setpoint still being replaced (%s -> %s) after %d repairs; "
-                    "giving up until it settles.",
+                    "%s: Setpoint still being replaced (%s -> %s) after trying "
+                    "%s; giving up until it settles.",
                     self._model_id,
                     wanted,
                     stuck_at,
-                    MAX_STUCK_SETPOINT_REPAIRS,
+                    CLEAN_TOGGLE_SECONDS,
                 )
                 self._fire_connection_event(
                     ConnectionEventType.STUCK_SETPOINT_UNFIXABLE,
                     {"consecutive": self._stuck_setpoint_repairs},
                 )
                 return
+            # Back off rather than repeating a duration that just failed.
+            seconds = CLEAN_TOGGLE_SECONDS[attempt]
             _LOGGER.info(
-                "%s: Device replaced setpoint %s with %s while off; repairing.",
+                "%s: Device replaced setpoint %s with %s while off; repairing "
+                "with a %gs clean.",
                 self._model_id,
                 wanted,
                 stuck_at,
+                seconds,
             )
             if self._auto_clear_stuck_setpoint_bug:
-                await self.clear_stuck_setpoint_bug(setpoint=wanted)
+                await self.clear_stuck_setpoint_bug(setpoint=wanted, seconds=seconds)
             self._fire_connection_event(
                 ConnectionEventType.STUCK_SETPOINT_REPAIRED,
                 {"wanted": wanted, "stuck_at": stuck_at},

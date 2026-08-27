@@ -151,19 +151,16 @@ CLEAN_TEMP_F = 75
 # device is not armed. Longest observed delay was 60s; this is double that.
 STUCK_SETPOINT_WATCH_SECONDS = 120.0
 
-# Consecutive power-offs needing repair before giving up. Reset by any power-off
-# where the setpoint survives the full watch window, which is the only real
-# evidence a repair took. Catches a repair that does nothing -- CLEAN_TOGGLE_
-# SECONDS being too short for a device, say -- which would otherwise run the pump
-# after every power-off forever. Running several deep cleans back to back with no
-# ordinary use in between could trip it, since each legitimately re-arms the
-# device; it self-heals on the next normal power-off.
-MAX_STUCK_SETPOINT_REPAIRS = 3
-
-# How long to leave the clean running before cancelling it. The device reports
-# clean mode within ~2s (CLEAN=1, SET_TEMP=CLEAN_TEMP_F); shorter values are
-# untested. The known-good value from manual testing was 20s.
-CLEAN_TOGGLE_SECONDS = 3.0
+# How long to leave the clean running before cancelling it, per attempt.
+#
+# The device reports clean mode within ~2s (CLEAN=1, SET_TEMP=CLEAN_TEMP_F), and
+# whether clearing needs any dwell beyond the CLEAN 1->0 transition is unknown.
+# 20s is the only duration proven by hand. So try the cheap value first and back
+# off: a repair that does nothing is invisible except that the setpoint is
+# replaced again on the next power-off, which is exactly when the next attempt
+# fires. Running out of entries means giving up (STUCK_SETPOINT_UNFIXABLE)
+# rather than running the pump after every power-off forever.
+CLEAN_TOGGLE_SECONDS = (3.0, 10.0, 30.0)
 
 # DEVICE_LOGS is a paging ring buffer of 6-byte records:
 #   (code: u8, param: u8, ts: int32 LE)  where ts is AGE IN SECONDS at read time.
