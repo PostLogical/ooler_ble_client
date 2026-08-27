@@ -98,9 +98,10 @@ Dataclass with fields: `power`, `mode`, `set_temperature`, `actual_temperature`,
 ### Connection Events
 
 - `ConnectionEvent` -- a connectivity event with `type`, `timestamp`, and optional `detail`
-- `ConnectionEventType` -- enum: `CONNECTED`, `DISCONNECTED`, `SUBSCRIPTION_MISMATCH`, `SUBSCRIPTION_RECOVERED`, `FORCED_RECONNECT`, `STUCK_SETPOINT_REPAIRED`, `STUCK_SETPOINT_UNFIXABLE`
-  - `STUCK_SETPOINT_REPAIRED` -- detail `{"wanted": int, "stuck_at": int}`. The repair briefly runs the pump and moves the setpoint, so surfacing this keeps that from looking like a glitch.
+- `ConnectionEventType` -- enum: `CONNECTED`, `DISCONNECTED`, `SUBSCRIPTION_MISMATCH`, `SUBSCRIPTION_RECOVERED`, `FORCED_RECONNECT`, `STUCK_SETPOINT_DETECTED`, `STUCK_SETPOINT_UNFIXABLE`, `STUCK_SETPOINT_RECOVERED`
+  - `STUCK_SETPOINT_DETECTED` -- detail `{"wanted": int, "stuck_at": int, "repaired": bool}`. The device replaced the setpoint; `repaired` says whether the client acted. When true the repair briefly ran the pump and moved the setpoint, so surfacing this keeps that from looking like a glitch.
   - `STUCK_SETPOINT_UNFIXABLE` -- detail `{"consecutive": int}`. Every clean duration was tried and none held; the setpoint really is being discarded and nothing will correct it.
+  - `STUCK_SETPOINT_RECOVERED` -- detail `{"after": int}`. A setpoint survived a full window off after an earlier repair. Fires on the transition only, so anything raised on `STUCK_SETPOINT_UNFIXABLE` has an edge to clear on.
 
 ### Other Types
 
@@ -173,7 +174,7 @@ By default the client handles it without any work from the consumer:
 
 1. Every power-off starts a watch.
 2. A setpoint change while the device stays off can only be the device's own doing -- it drops writes while off, and its single-connection limit means nothing else can be writing.
-3. The repair is applied, the setpoint the user asked for is restored, and `STUCK_SETPOINT_REPAIRED` is emitted.
+3. The repair is applied, the setpoint the user asked for is restored, and `STUCK_SETPOINT_DETECTED` is emitted with `repaired: True`.
 
 Repairs back off rather than repeating a duration that just failed: `CLEAN_TOGGLE_SECONDS` is `(3.0, 10.0, 30.0)` and each attempt takes the next entry. Running out emits `STUCK_SETPOINT_UNFIXABLE` and stops, rather than running the pump after every power-off forever.
 

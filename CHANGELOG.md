@@ -20,12 +20,18 @@ hardware through the automatic path -- see Unverified below.
   - Every power-off starts a watch. A setpoint change while the device stays off
     can only be the device's own doing, since it drops writes while off and its
     single-connection limit means nothing else can be writing.
-  - `ConnectionEventType.STUCK_SETPOINT_REPAIRED` -- detail carries `wanted` and
-    `stuck_at`. Emitted so the brief pump run and setpoint blip are explained.
   - Repairs back off rather than repeating a duration that just failed:
     `CLEAN_TOGGLE_SECONDS` is a schedule, `(3.0, 10.0, 30.0)`, and each attempt
-    takes the next entry. Only 20s has been proven by hand, so the cheap value
-    is tried first and the proven range is the fallback.
+    takes the next entry. 3s is confirmed on hardware; the longer entries are
+    headroom in case some device needs more.
+  - `ConnectionEventType.STUCK_SETPOINT_DETECTED` -- detail carries `wanted`,
+    `stuck_at` and `repaired`. One event for the occurrence; the flag says
+    whether the client acted, so the opt-out path reports what it saw without
+    claiming to have fixed anything.
+  - `ConnectionEventType.STUCK_SETPOINT_RECOVERED` -- detail carries `after`.
+    Fires when a setpoint survives a full watch window following an earlier
+    repair, on the transition only. Gives consumers an edge to clear anything
+    they raised on `STUCK_SETPOINT_UNFIXABLE`.
   - `ConnectionEventType.STUCK_SETPOINT_UNFIXABLE` -- detail carries
     `consecutive`. Emitted once every duration has been tried and none held, at
     which point the client stops running the pump to no effect.
@@ -35,6 +41,10 @@ hardware through the automatic path -- see Unverified below.
   against the previous capture with sensor noise separated from real changes.
 
 ### Fixed
+- With `auto_clear_stuck_setpoint_bug=False`, the give-up counter no longer
+  climbs and `STUCK_SETPOINT_UNFIXABLE` can no longer fire. It previously
+  reported every clean duration as tried when none had been attempted, and
+  claimed a repair that never happened.
 - `set_clean(False)` no longer powers the device on. The power-on branch ran for
   stopping as well as starting, so telling an idle device to stop cleaning woke
   it and resent mode and temperature. The device drops writes while off, so it

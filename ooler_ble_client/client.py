@@ -857,7 +857,13 @@ class OolerBLEDevice:
                 if self._monotonic() > deadline:
                     # Setpoint survived a full window off, so any earlier
                     # repair took: the device is behaving again.
-                    self._stuck_setpoint_repairs = 0
+                    if self._stuck_setpoint_repairs:
+                        after = self._stuck_setpoint_repairs
+                        self._stuck_setpoint_repairs = 0
+                        self._fire_connection_event(
+                            ConnectionEventType.STUCK_SETPOINT_RECOVERED,
+                            {"after": after},
+                        )
                     return
                 await asyncio.sleep(1)
             if self._state.power:
@@ -866,6 +872,23 @@ class OolerBLEDevice:
                 # the next power-off will catch it.
                 return
             stuck_at = self._state.set_temperature
+            if not self._auto_clear_stuck_setpoint_bug:
+                # Told not to act, so report and stop. The failure count must
+                # not climb here: it records repairs that did not hold, and
+                # concluding "unfixable" from repairs never attempted would be
+                # a lie.
+                _LOGGER.info(
+                    "%s: Device replaced setpoint %s with %s while off; "
+                    "not repairing (auto_clear_stuck_setpoint_bug is off).",
+                    self._model_id,
+                    wanted,
+                    stuck_at,
+                )
+                self._fire_connection_event(
+                    ConnectionEventType.STUCK_SETPOINT_DETECTED,
+                    {"wanted": wanted, "stuck_at": stuck_at, "repaired": False},
+                )
+                return
             attempt = self._stuck_setpoint_repairs
             self._stuck_setpoint_repairs += 1
             if attempt >= len(CLEAN_TOGGLE_SECONDS):
@@ -894,11 +917,10 @@ class OolerBLEDevice:
                 stuck_at,
                 seconds,
             )
-            if self._auto_clear_stuck_setpoint_bug:
-                await self.clear_stuck_setpoint_bug(setpoint=wanted, seconds=seconds)
+            await self.clear_stuck_setpoint_bug(setpoint=wanted, seconds=seconds)
             self._fire_connection_event(
-                ConnectionEventType.STUCK_SETPOINT_REPAIRED,
-                {"wanted": wanted, "stuck_at": stuck_at},
+                ConnectionEventType.STUCK_SETPOINT_DETECTED,
+                {"wanted": wanted, "stuck_at": stuck_at, "repaired": True},
             )
         except Exception as err:  # noqa: BLE001 - background task, nothing to raise to
             _LOGGER.warning(
