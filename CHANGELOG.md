@@ -54,12 +54,18 @@ hardware through the automatic path -- see Unverified below.
   confirmed by controlled writes. Reading the log drains it, so the client does
   not read it; this is for debugging only.
 
+### Verified on hardware
+- The full chain: a library-initiated deep clean run to completion armed a
+  device (it substituted the setpoint 20s after power-off), a 3s
+  `clear_stuck_setpoint_bug()` repaired it, and the setpoint then held for 10
+  minutes. The value the device substitutes is the setpoint that was live during
+  the clean.
+- A full deep clean takes ~45 minutes, so escalating retries span days of
+  ordinary use rather than minutes.
+
 ### Unverified
-- The shortest `CLEAN_TOGGLE_SECONDS` entries (3s, 10s) are untested; only 20s
-  has been proven by hand. A too-short toggle fails invisibly, so the schedule
-  backs off through 30s before giving up.
-- The automatic detect-and-repair path has not run against hardware. All
-  hardware confirmation to date used manual toggles.
+- `_watch_for_stuck_setpoint` -- the automatic trigger -- has not run against
+  hardware; the repair it calls has. Detection is unit-tested only.
 - Repeated deep cleans with no ordinary use between them can trip the give-up
   counter, since each legitimately re-arms the device. It self-heals on the next
   normal power-off.

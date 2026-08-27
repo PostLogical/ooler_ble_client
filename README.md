@@ -53,9 +53,9 @@ asyncio.run(main())
 
 ## API
 
-### `OolerBLEDevice(model: str)`
+### `OolerBLEDevice(model: str, auto_clear_stuck_setpoint_bug: bool = True)`
 
-Main client class.
+Main client class. `auto_clear_stuck_setpoint_bug` controls whether the client repairs a device it catches substituting its own setpoint after a power-off -- see [Stuck Setpoint Bug](#stuck-setpoint-bug). Pass `False` to be told about it via connection events and handle it yourself.
 
 - `set_ble_device(device)` -- set the BLE device to connect to
 - `connect()` -- establish BLE connection, read initial state, subscribe to notifications
@@ -67,7 +67,8 @@ Main client class.
 - `set_power(bool)` -- turn device on/off (re-sends mode and temperature on power-on)
 - `set_mode(OolerMode)` -- set pump mode: `"Silent"`, `"Regular"`, or `"Boost"`
 - `set_temperature(int)` -- set target temperature in the current display unit
-- `set_clean(bool)` -- start/stop clean cycle (automatically powers on)
+- `set_clean(bool)` -- start/stop clean cycle. Starting one powers the device on; stopping one does not, since the device drops writes while off
+- `clear_stuck_setpoint_bug(setpoint=None, seconds=None)` -- work around the firmware bug described in [Stuck Setpoint Bug](#stuck-setpoint-bug). Optionally leaves the device at a given temperature
 - `set_temperature_unit(TemperatureUnit)` -- set device display unit: `"C"` or `"F"`
 - `address` -- BLE device address
 - `register_connection_event_callback(fn)` -- register a connectivity event callback, returns an unsubscribe function
@@ -97,7 +98,9 @@ Dataclass with fields: `power`, `mode`, `set_temperature`, `actual_temperature`,
 ### Connection Events
 
 - `ConnectionEvent` -- a connectivity event with `type`, `timestamp`, and optional `detail`
-- `ConnectionEventType` -- enum: `CONNECTED`, `DISCONNECTED`, `SUBSCRIPTION_MISMATCH`, `SUBSCRIPTION_RECOVERED`, `FORCED_RECONNECT`
+- `ConnectionEventType` -- enum: `CONNECTED`, `DISCONNECTED`, `SUBSCRIPTION_MISMATCH`, `SUBSCRIPTION_RECOVERED`, `FORCED_RECONNECT`, `STUCK_SETPOINT_REPAIRED`, `STUCK_SETPOINT_UNFIXABLE`
+  - `STUCK_SETPOINT_REPAIRED` -- detail `{"wanted": int, "stuck_at": int}`. The repair briefly runs the pump and moves the setpoint, so surfacing this keeps that from looking like a glitch.
+  - `STUCK_SETPOINT_UNFIXABLE` -- detail `{"consecutive": int}`. Every clean duration was tried and none held; the setpoint really is being discarded and nothing will correct it.
 
 ### Other Types
 
@@ -157,6 +160,24 @@ The library handles this automatically:
 - `state.actual_temperature` is passed through as-is from the device.
 
 The display unit is read once on connect and cached. It can be changed via `set_temperature_unit()`.
+
+## Stuck Setpoint Bug
+
+On firmware 15.20, **a deep clean run to completion commits the device's current setpoint to non-volatile storage and makes the device restore it on every subsequent power-off.** Any temperature set afterwards is silently discarded a few seconds after the unit is turned off. Users see this as the Ooler resetting their temperature.
+
+**Starting a clean and cancelling it before it completes clears the state.** A clean left to finish never can, because completion ends by powering the device off and so never sends `CLEAN=0` -- which is why running more deep cleans cannot fix what a deep clean caused.
+
+This was reproduced in both directions on two devices, armed once through Home Assistant and once through the official app, so it is device firmware rather than client behaviour.
+
+By default the client handles it without any work from the consumer:
+
+1. Every power-off starts a watch.
+2. A setpoint change while the device stays off can only be the device's own doing -- it drops writes while off, and its single-connection limit means nothing else can be writing.
+3. The repair is applied, the setpoint the user asked for is restored, and `STUCK_SETPOINT_REPAIRED` is emitted.
+
+Repairs back off rather than repeating a duration that just failed: `CLEAN_TOGGLE_SECONDS` is `(3.0, 10.0, 30.0)` and each attempt takes the next entry. Running out emits `STUCK_SETPOINT_UNFIXABLE` and stops, rather than running the pump after every power-off forever.
+
+Note the revert delay is highly variable -- 3s to 60s observed -- so any manual check needs minutes, not seconds.
 
 ## License
 
