@@ -915,7 +915,9 @@ class OolerBLEDevice:
         deadline = self._monotonic() + SETPOINT_OVERRIDE_WATCH_SECONDS
         try:
             while self._state.set_temperature == reported:
-                if self._state.power:
+                # Back in use, or no longer holding the connection this whole
+                # premise rests on. Either way nothing was observed.
+                if self._state.power or not self.is_connected:
                     return
                 if self._monotonic() > deadline:
                     # Survived a full window off, so any earlier fix worked.

@@ -2453,3 +2453,20 @@ class TestSetpointOverride:
         with _patch_establish(mock_client):
             await device.connect()
         assert device._last_notified_power is device.state.power
+
+    @pytest.mark.asyncio
+    async def test_a_dropped_connection_is_not_evidence_the_fix_worked(self) -> None:
+        """The watch's premise is that we hold the device's only connection.
+        Timing out while disconnected observed nothing, so it must not clear the
+        escalation -- a device that had failed at 0s would retry 0s instead of
+        moving to 3s."""
+        device, _client = _make_connected_device(power=False)
+        device._override_fixes_tried = 1
+
+        async def _link_drops(_delay: float) -> None:
+            device._client = None
+
+        with patch("asyncio.sleep", AsyncMock(side_effect=_link_drops)):
+            await device._watch_for_setpoint_override()
+
+        assert device._override_fixes_tried == 1

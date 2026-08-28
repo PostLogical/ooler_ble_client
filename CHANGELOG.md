@@ -17,6 +17,13 @@ Supersedes all earlier 1.1.0 betas. Use this one.
   stale because the device forces its temperature "a couple of seconds later."
   That figure came from a poll observation, not notification timing. There is no
   margin — the reply lands inside the await.
+- **A dropped connection could clear the escalation.** The watch treated its
+  timeout as "the setpoint survived a full window off", but nothing updates
+  cached state while disconnected, so a watch that lost the link timed out
+  having observed nothing and reset the attempt count. A device that had failed
+  at 0s would retry 0s rather than escalating. The watch now stops when the
+  connection it depends on is gone, alongside the existing check for the device
+  being back in use — both mean the same thing.
 
 ### Verified on hardware (trial 2)
 - **The 0s first attempt is sufficient.** ~222ms between the `CLEAN=1` and
