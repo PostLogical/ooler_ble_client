@@ -133,6 +133,9 @@ class OolerBLEDevice:
         # for its duration, and the override replaces it outright. Exists so a
         # fix can put back the right value.
         self._last_user_setpoint: int | None = None
+        # Power as the device last reported it, which is not state.power: the
+        # setters set that optimistically, so it cannot show a transition.
+        self._last_notified_power: bool | None = None
         self._setpoint_override_watch: asyncio.Task[None] | None = None
         self._override_fixes_tried: int = 0
         # A clean this client started for a fix and has not yet stopped.
@@ -376,8 +379,13 @@ class OolerBLEDevice:
             )
             changed = False
             if uuid == POWER_CHAR:
-                was_on = bool(self._state.power)
+                # Read the transition from what the device has told us, not from
+                # state.power: the setters update that optimistically, so by the
+                # time a commanded power-off is notified the cached value
+                # already says off and the transition would be invisible.
+                was_on = self._last_notified_power
                 is_on = bool(int.from_bytes(data, "little"))
+                self._last_notified_power = is_on
                 if self._state.power != is_on:
                     self._state.power = is_on
                     changed = True
@@ -534,6 +542,11 @@ class OolerBLEDevice:
                 # Clean poll — any pending Tier 1 proved itself out.
                 self._tier1_pending = False
 
+        # A poll is device truth as much as a notification is, so it keeps the
+        # transition baseline current. Without this the first power-off after
+        # every connection would go unwatched, since connect() establishes
+        # power by polling rather than by notification.
+        self._last_notified_power = state.power
         self._set_state_and_fire_callbacks(state)
         self._consistency_check_armed = True
         _LOGGER.debug("%s: State retrieved.", self._model_id)

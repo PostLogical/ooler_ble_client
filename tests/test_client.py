@@ -2321,6 +2321,7 @@ class TestSetpointOverride:
     @pytest.mark.asyncio
     async def test_disconnect_cancels_the_watch(self) -> None:
         device, _client = _make_connected_device(power=True)
+        device._last_notified_power = True
         device._notification_handler(_make_sender(POWER_CHAR), bytearray(b"\x00"))
         task = device._setpoint_override_watch
         assert task is not None
@@ -2418,3 +2419,31 @@ class TestSetpointOverride:
         device._notification_handler(_make_sender(POWER_CHAR), bytearray(b"\x00"))
         assert device._setpoint_override_watch is not None  # on -> off
         await _finish_override_watch(device)
+
+    @pytest.mark.asyncio
+    async def test_a_power_off_commanded_through_the_library_is_watched(self) -> None:
+        """set_power updates state.power optimistically, so by the time the
+        device's own notification arrives the cached value already says off.
+        Reading the transition from state.power would miss every power-off made
+        through Home Assistant -- the normal case."""
+        device, _client = _make_connected_device(power=True)
+        device._last_notified_power = True
+
+        await device.set_power(False)
+        assert device.state.power is False  # cached, ahead of the device
+
+        device._notification_handler(_make_sender(POWER_CHAR), bytearray(b"\x00"))
+
+        assert device._setpoint_override_watch is not None
+        await _finish_override_watch(device)
+
+    @pytest.mark.asyncio
+    async def test_a_poll_establishes_the_transition_baseline(self) -> None:
+        """connect() learns the power state by polling, not by notification, so
+        without this the first power-off after every connection is unwatched."""
+        mock_client = _make_mock_client()
+        device = OolerBLEDevice(model="OOLER-TEST")
+        device.set_ble_device(MagicMock())
+        with _patch_establish(mock_client):
+            await device.connect()
+        assert device._last_notified_power is device.state.power

@@ -12,6 +12,13 @@ Supersedes all earlier 1.1.0 betas. Use this one.
   watching them risks reading a stale cached setpoint as an override and
   powering the unit on to "fix" it.
 
+  The transition is read from what the device has reported, not from
+  `state.power`. The setters update that optimistically, so by the time a
+  commanded power-off is notified the cached value already says off -- reading
+  it there would have missed every power-off made through a consumer, which is
+  the normal case. A poll keeps the same baseline current, since `connect()`
+  learns the power state by polling rather than by notification.
+
 ## 1.1.0b5
 
 ### Fixed
