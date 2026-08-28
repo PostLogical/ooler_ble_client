@@ -35,6 +35,7 @@ from .const import (
     ACTUALTEMP_CHAR,
     WATER_LEVEL_CHAR,
     CLEAN_CHAR,
+    CLEAN_TEMP_F,
     FIX_CLEAN_SECONDS,
     SETPOINT_OVERRIDE_WATCH_SECONDS,
     DISPLAY_TEMPERATURE_UNIT_CHAR,
@@ -414,9 +415,22 @@ class OolerBLEDevice:
                 if self._state.set_temperature != set_temperature:
                     self._state.set_temperature = set_temperature
                     changed = True
-                    if self._state.power and not self._state.clean:
+                    if (
+                        self._state.power
+                        and not self._state.clean
+                        and settemp_f != CLEAN_TEMP_F
+                    ):
                         # A person asked for this. The device changes the
                         # setpoint by itself only while cleaning or while off.
+                        #
+                        # CLEAN_TEMP_F is excluded because self._state.clean is
+                        # polled, not notified: a clean started at the unit or
+                        # in the vendor's app forces the setpoint within a
+                        # couple of seconds, long before a poll tells us a clean
+                        # is running, so the flag alone would let the clean's
+                        # value be recorded as a person's. Compared in
+                        # Fahrenheit because settemp_f is the raw device value;
+                        # set_temperature above is in display units.
                         self._last_user_setpoint = set_temperature
             elif uuid == ACTUALTEMP_CHAR:
                 actualtemp_int = int.from_bytes(data, "little")
@@ -852,9 +866,16 @@ class OolerBLEDevice:
         finally:
             # Stop the clean even if the wait was interrupted. A clean left
             # running finishes on its own, and finishing is what causes the
-            # override — the fix would become the cause. If this write fails
-            # too, the flag stays set and connect() finishes the job.
-            await self.set_clean(False)
+            # override — the fix would become the cause.
+            #
+            # Written directly rather than through set_clean, which skips the
+            # write when it believes the device is off. That guard is right for
+            # external callers but wrong here: this clean is ours, the device
+            # was powered on to start it, and a skipped write would clear the
+            # flag below while the clean was still running. _write_gatt raises
+            # if it cannot land, so the flag survives for connect() to act on.
+            await self._write_gatt(CLEAN_CHAR, b"\x00")
+            self._state.clean = False
             self._fix_started_clean = False
         if setpoint is not None:
             await self.set_temperature(setpoint)
