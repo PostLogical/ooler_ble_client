@@ -5,18 +5,6 @@
 Supersedes all earlier 1.1.0 betas. Use this one.
 
 ### Fixed
-- **A clean started outside this client could pose as the user's setpoint.**
-  `state.clean` is polled every five minutes and is only set locally when this
-  client starts a clean, but a clean started at the unit or in the vendor's app
-  forces the setpoint to `CLEAN_TEMP_F` within a couple of seconds. That
-  notification was recorded as a person's choice, so the fix wrote 75 back and
-  discarded what they had set — on the most ordinary way to arm the behaviour.
-
-  Excluded where the value is captured rather than where it is used, since the
-  variable means "what a person asked for" and a device-forced value should
-  never be in it. Compared against the raw Fahrenheit the device sends: in
-  Celsius both 75F and 76F display as 24C, so a display-unit comparison would
-  reject a genuine 76F as well.
 - **The fix could clear its own recovery flag without stopping the clean.** Its
   cancel went through `set_clean`, which skips the write when it believes the
   device is off — right for external callers, wrong here, since the clean is

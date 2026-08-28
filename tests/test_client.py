@@ -2384,16 +2384,16 @@ class TestSetpointOverride:
         await _finish_override_watch(device)
 
     @pytest.mark.asyncio
-    async def test_a_clean_started_elsewhere_cannot_pose_as_the_users_choice(
-        self,
-    ) -> None:
-        """state.clean is polled, not notified. A clean started at the unit or in
-        the vendor's app forces the setpoint within ~2s, long before a poll says
-        a clean is running -- so the flag alone would record the clean's value as
-        a person's, and the fix would write it back."""
+    async def test_a_clean_we_started_does_not_pose_as_the_users_choice(self) -> None:
+        """The device forces its own temperature a couple of seconds into a
+        clean. state.clean is polled, but it cannot be stale here: a clean can
+        only be started by a connected client, so either we started it -- and
+        set_clean set the flag first -- or another client holds the device's
+        single connection and we are receiving nothing at all."""
         device, _client = _make_connected_device(power=True)
         await device.set_temperature(62)
-        assert not device._state.clean  # no poll has said otherwise yet
+        await device.set_clean(True)
+        assert device._state.clean is True  # set before the device forces its own
 
         device._notification_handler(
             _make_sender(SETTEMP_CHAR), bytearray(bytes([CLEAN_TEMP_F]))
@@ -2401,34 +2401,3 @@ class TestSetpointOverride:
 
         assert device.state.set_temperature == CLEAN_TEMP_F  # reported faithfully
         assert device._last_user_setpoint == 62  # but not mistaken for intent
-
-    @pytest.mark.asyncio
-    async def test_the_clean_temperature_is_recognised_in_fahrenheit(self) -> None:
-        """In Celsius both 75F and 76F display as 24C, so comparing in display
-        units would reject a real 76F as if it were the clean's value. The check
-        uses the raw Fahrenheit the device sends, which keeps them distinct.
-
-        Judged from the same starting point on two devices, since within one
-        device the second value would register no change at all -- which is the
-        very collision this guards against.
-        """
-        assert _f_to_c(CLEAN_TEMP_F) == _f_to_c(CLEAN_TEMP_F + 1)  # the collision
-
-        def _celsius_device_at(displayed: int) -> OolerBLEDevice:
-            device, _client = _make_connected_device(power=True)
-            device._state.temperature_unit = "C"
-            device._state.set_temperature = displayed
-            device._last_user_setpoint = displayed
-            return device
-
-        forced = _celsius_device_at(20)
-        forced._notification_handler(
-            _make_sender(SETTEMP_CHAR), bytearray(bytes([CLEAN_TEMP_F]))
-        )
-        assert forced._last_user_setpoint == 20  # the clean's value, not intent
-
-        chosen = _celsius_device_at(20)
-        chosen._notification_handler(
-            _make_sender(SETTEMP_CHAR), bytearray(bytes([CLEAN_TEMP_F + 1]))
-        )
-        assert chosen._last_user_setpoint == _f_to_c(CLEAN_TEMP_F + 1)

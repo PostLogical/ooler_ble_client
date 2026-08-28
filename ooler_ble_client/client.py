@@ -35,7 +35,6 @@ from .const import (
     ACTUALTEMP_CHAR,
     WATER_LEVEL_CHAR,
     CLEAN_CHAR,
-    CLEAN_TEMP_F,
     FIX_CLEAN_SECONDS,
     SETPOINT_OVERRIDE_WATCH_SECONDS,
     DISPLAY_TEMPERATURE_UNIT_CHAR,
@@ -415,22 +414,19 @@ class OolerBLEDevice:
                 if self._state.set_temperature != set_temperature:
                     self._state.set_temperature = set_temperature
                     changed = True
-                    if (
-                        self._state.power
-                        and not self._state.clean
-                        and settemp_f != CLEAN_TEMP_F
-                    ):
+                    if self._state.power and not self._state.clean:
                         # A person asked for this. The device changes the
                         # setpoint by itself only while cleaning or while off.
                         #
-                        # CLEAN_TEMP_F is excluded because self._state.clean is
-                        # polled, not notified: a clean started at the unit or
-                        # in the vendor's app forces the setpoint within a
-                        # couple of seconds, long before a poll tells us a clean
-                        # is running, so the flag alone would let the clean's
-                        # value be recorded as a person's. Compared in
-                        # Fahrenheit because settemp_f is the raw device value;
-                        # set_temperature above is in display units.
+                        # state.clean is polled rather than notified, but it
+                        # cannot be stale here, because a clean can only be
+                        # started by a connected client. Either we started it,
+                        # and set_clean set the flag before the device forced
+                        # its own temperature ~2s later; or another client
+                        # started it, which means it holds the device's single
+                        # connection and we are receiving nothing at all. On
+                        # reconnect, connect() polls before subscribing, so the
+                        # flag is fresh before any notification can arrive.
                         self._last_user_setpoint = set_temperature
             elif uuid == ACTUALTEMP_CHAR:
                 actualtemp_int = int.from_bytes(data, "little")
