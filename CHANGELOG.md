@@ -1,5 +1,64 @@
 # Changelog
 
+## 1.1.0b3
+
+Supersedes 1.1.0b1 and 1.1.0b2, which write the wrong temperature on the most
+common path. Use this instead.
+
+### Added
+- **Setpoint override detection and fix.** A deep clean run to completion makes
+  the device override the setpoint every time it is powered off, silently
+  discarding anything set afterwards. Reproduced in both directions on two
+  devices, triggered from Home Assistant, the vendor's app and this library, so
+  it is device firmware rather than any client's doing.
+  - `fix_setpoint_override(setpoint=None, clean_seconds=None)` -- starts a clean
+    and cancels it, the only thing that clears the condition. Cancelling makes
+    the device restore its own stored setpoint; `setpoint` overwrites that, and
+    `None` keeps it.
+  - Every power-off starts a watch. A setpoint change while the device stays off
+    can only be the device itself: it drops writes while off, its buttons cannot
+    change the setpoint while off, and it accepts one connection at a time.
+  - `ConnectionEventType.SETPOINT_OVERRIDE_FIXED` -- detail carries `overrode`,
+    `overrode_with`, `restored` and `attempt`. For logging; needs no attention.
+  - `ConnectionEventType.SETPOINT_OVERRIDE_UNFIXABLE` -- detail carries
+    `attempts`. Needs a person: the temperature is being discarded and nothing
+    will correct it.
+  - Attempts use successively longer clean durations (`FIX_CLEAN_SECONDS`,
+    0s/3s/30s) rather than repeating one that just failed. 3s is confirmed on
+    hardware; trying nothing first means the usual case costs one round trip.
+- `diagnostics/capture.py` -- labelled snapshot of every Ooler in range, diffed
+  against the previous capture with sensor noise separated from real changes.
+
+### Fixed
+- `set_clean(False)` no longer powers the device on. That branch ran for stopping
+  as well as starting, so telling an idle device to stop cleaning woke it and
+  resent mode and temperature.
+- A fix never leaves a clean running. A clean that finishes causes the very
+  override the fix was clearing, plus a 45-minute cycle; if the cancel cannot
+  land, the next connection stops it.
+- The fix restores what a person asked for, not the clean's forced 75. On the
+  first override after a clean the reported setpoint is the clean's artifact, so
+  earlier betas wrote that back and destroyed the user's setting.
+- The fix fires state callbacks when it finishes. It moves power and setpoint
+  unasked, and the setters update cached state without notifying.
+
+### Changed
+- `SUB_FIRMWARE_CHAR` renamed to `UNKNOWN_9A5F_CHAR`. It is not a firmware
+  version: it moves with use, and a runtime-proportional model was falsified --
+  `RUNTIME` and `LIFETIME` both *decrease* across an abrupt power cut, so they
+  are not monotonic.
+- `UNKNOWN_9234` documentation corrected; its previous annotation linked it to a
+  temperature revert bug, which was coincidence.
+- `DEVICE_LOGS` record format documented in `const.py`. Reading it drains it, so
+  the client does not; this is for debugging only.
+
+### Known gaps
+- A clean completing while nothing is connected is not noticed, so the device
+  stays overridden until something connects and the symptom shows on a later
+  power-off. A delayed fix, not a missed one.
+- Only the 3s clean duration is confirmed on hardware; 0s and 30s are untried.
+- The watch itself has not run against hardware; the fix it calls has.
+
 ## 1.1.0b2
 
 Field-trial fixes from the first real detect-repair-recover cycle on hardware.

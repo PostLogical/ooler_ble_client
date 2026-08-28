@@ -53,9 +53,9 @@ asyncio.run(main())
 
 ## API
 
-### `OolerBLEDevice(model: str, auto_clear_stuck_setpoint_bug: bool = True)`
+### `OolerBLEDevice(model: str)`
 
-Main client class. `auto_clear_stuck_setpoint_bug` controls whether the client repairs a device it catches substituting its own setpoint after a power-off -- see [Stuck Setpoint Bug](#stuck-setpoint-bug). Pass `False` to be told about it via connection events and handle it yourself.
+Main client class.
 
 - `set_ble_device(device)` -- set the BLE device to connect to
 - `connect()` -- establish BLE connection, read initial state, subscribe to notifications
@@ -68,7 +68,7 @@ Main client class. `auto_clear_stuck_setpoint_bug` controls whether the client r
 - `set_mode(OolerMode)` -- set pump mode: `"Silent"`, `"Regular"`, or `"Boost"`
 - `set_temperature(int)` -- set target temperature in the current display unit
 - `set_clean(bool)` -- start/stop clean cycle. Starting one powers the device on; stopping one does not, since the device drops writes while off
-- `clear_stuck_setpoint_bug(setpoint=None, seconds=None)` -- work around the firmware bug described in [Stuck Setpoint Bug](#stuck-setpoint-bug). Optionally leaves the device at a given temperature
+- `fix_setpoint_override(setpoint=None, clean_seconds=None)` -- clear the firmware behaviour described in [Setpoint Override After a Deep Clean](#setpoint-override-after-a-deep-clean). `setpoint=None` keeps whatever the device restores by itself
 - `set_temperature_unit(TemperatureUnit)` -- set device display unit: `"C"` or `"F"`
 - `address` -- BLE device address
 - `register_connection_event_callback(fn)` -- register a connectivity event callback, returns an unsubscribe function
@@ -98,10 +98,9 @@ Dataclass with fields: `power`, `mode`, `set_temperature`, `actual_temperature`,
 ### Connection Events
 
 - `ConnectionEvent` -- a connectivity event with `type`, `timestamp`, and optional `detail`
-- `ConnectionEventType` -- enum: `CONNECTED`, `DISCONNECTED`, `SUBSCRIPTION_MISMATCH`, `SUBSCRIPTION_RECOVERED`, `FORCED_RECONNECT`, `STUCK_SETPOINT_DETECTED`, `STUCK_SETPOINT_UNFIXABLE`, `STUCK_SETPOINT_RECOVERED`
-  - `STUCK_SETPOINT_DETECTED` -- detail `{"trigger": str, "wanted": int, "stuck_at": int | None, "repaired": bool}`. `trigger` is `"clean_completed"` (a clean finished, which arms the bug; repaired pre-emptively, `stuck_at` is `None`) or `"observed"` (the device was caught substituting). `repaired` says whether the client acted. When true the repair briefly ran the pump and moved the setpoint, so surfacing this keeps that from looking like a glitch.
-  - `STUCK_SETPOINT_UNFIXABLE` -- detail `{"consecutive": int}`. Every clean duration was tried and none held; the setpoint really is being discarded and nothing will correct it. Re-fires on each subsequent stuck power-off, so raising the same issue repeatedly is idempotent.
-  - `STUCK_SETPOINT_RECOVERED` -- detail `{"after": int}`. A setpoint survived a full window off after an earlier repair. Fires on the transition only, so anything raised on `STUCK_SETPOINT_UNFIXABLE` has an edge to clear on. Note it also follows an ordinary successful repair about a watch window later, so the healthy path is `DETECTED{repaired: True}` then `RECOVERED{after: 1}` -- treat clearing as idempotent. It stays quiet when the observation could not have shown a failure, i.e. when the setpoint already equals the value the device substitutes.
+- `ConnectionEventType` -- enum: `CONNECTED`, `DISCONNECTED`, `SUBSCRIPTION_MISMATCH`, `SUBSCRIPTION_RECOVERED`, `FORCED_RECONNECT`, `SETPOINT_OVERRIDE_FIXED`, `SETPOINT_OVERRIDE_UNFIXABLE`
+  - `SETPOINT_OVERRIDE_FIXED` -- detail `{"overrode": int, "overrode_with": int, "restored": int | None, "attempt": int}`. Worth logging; needs no attention. The fix briefly runs the pump and moves the setpoint to 75.
+  - `SETPOINT_OVERRIDE_UNFIXABLE` -- detail `{"attempts": int}`. Every duration was tried and none held; the user's temperature is being discarded and nothing will correct it.
 
 ### Other Types
 
@@ -162,33 +161,27 @@ The library handles this automatically:
 
 The display unit is read once on connect and cached. It can be changed via `set_temperature_unit()`.
 
-## Stuck Setpoint Bug
+## Setpoint Override After a Deep Clean
 
-On firmware 15.20, **a deep clean run to completion commits the device's current setpoint to non-volatile storage and makes the device restore it on every subsequent power-off.** Any temperature set afterwards is silently discarded a few seconds after the unit is turned off. Users see this as the Ooler resetting their temperature.
+On firmware 15.20, **a deep clean run to completion makes the device override the setpoint every time it is powered off**, replacing it with the value stored when the clean ran. Anything set afterwards is silently discarded. Users see this as the Ooler resetting their temperature.
 
-**Starting a clean and cancelling it before it completes clears the state.** A clean left to finish never can, because completion ends by powering the device off and so never sends `CLEAN=0` -- which is why running more deep cleans cannot fix what a deep clean caused.
+**Starting a clean and cancelling it before it completes clears the condition.** A clean left to finish never can, because finishing ends by powering the device off and so never sends `CLEAN=0` — which is why running more deep cleans cannot fix what a deep clean caused.
 
-This was reproduced in both directions on two devices, armed once through Home Assistant and once through the official app, so it is device firmware rather than client behaviour.
+Reproduced in both directions on two devices, triggered from Home Assistant, the vendor's app and this library, so it is device firmware rather than any client's doing.
 
-By default the client handles it without any work from the consumer:
+The client handles it without any work from the consumer:
 
-1. A completed deep clean is repaired at once, since it is known to arm the bug.
-2. Otherwise, every power-off starts a watch.
-3. A setpoint change while the device stays off can only be the device's own doing -- it drops writes while off, and its single-connection limit means nothing else can be writing.
-4. The repair is applied, the setpoint the user asked for is restored, and `STUCK_SETPOINT_DETECTED` is emitted with `repaired: True`.
+1. Every power-off starts a watch (`SETPOINT_OVERRIDE_WATCH_SECONDS`).
+2. A setpoint change while the device stays off can only be the device itself — it drops writes while off, its buttons cannot change the setpoint while off, and it accepts one connection at a time.
+3. `fix_setpoint_override()` runs, and `SETPOINT_OVERRIDE_FIXED` is emitted.
 
-Repairs back off rather than repeating a duration that just failed: `CLEAN_TOGGLE_SECONDS` is `(3.0, 10.0, 30.0)` and each attempt takes the next entry. Running out emits `STUCK_SETPOINT_UNFIXABLE` and stops, rather than running the pump after every power-off forever.
+Cancelling makes the device restore its own stored setpoint. The client overwrites that only if a person actually asked for something — on the first override after a clean, the reported value is the clean's forced 75 while the device's stored value is the pre-clean setpoint, which is the better answer.
 
-Note the revert delay is highly variable -- 3s to 60s observed -- so any manual check needs minutes, not seconds.
+Attempts use successively longer clean durations (`FIX_CLEAN_SECONDS`, 0s/3s/30s) rather than repeating one that just failed. Running out emits `SETPOINT_OVERRIDE_UNFIXABLE` and stops, rather than running the pump after every power-off forever.
 
-**Known gap:** a clean that completes while nothing is connected is not repaired
-pre-emptively, because the client never sees the power-off that ends it. This is
-reachable with nobody present -- a clean can be started at the unit's own buttons
-with no BLE client attached, and connections drop on their own. The device stays
-stuck until something connects and the symptom appears on a later power-off, at
-which point the watch repairs it as normal. The consequence is a delayed repair,
-not a missed one. Detecting it on connect would mean reading `DEVICE_LOGS`, which
-destroys the log the official app also reads, so the client does not.
+The override lands 3s to 60s after power-off with no pattern we can find, so any manual check needs minutes, not seconds.
+
+**Known gap:** a clean completing while nothing is connected is not noticed, so the device stays overridden until something connects and the symptom shows on a later power-off. Reachable with nobody present — cleans can be started at the unit's buttons, and connections drop on their own. The consequence is a delayed fix, not a missed one.
 
 ## License
 
