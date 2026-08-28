@@ -155,13 +155,14 @@ SETPOINT_OVERRIDE_WATCH_SECONDS = 120.0
 # How long to leave the fix's clean running before cancelling it, one entry per
 # attempt; running out of entries is what gives up.
 #
-# Nothing is tried first. If cancelling immediately clears the override, the
-# usual case costs a single round trip and there is almost no window in which a
-# dropped connection could leave a clean running to completion -- which would
-# cause the very override being fixed. 3s is confirmed on hardware, 30s is
-# headroom for a device that might need longer. A dwell that does not work is
-# invisible except that the setpoint is overridden again on the next power-off,
-# which is exactly when the next entry is tried.
+# Nothing is tried first, and that is enough: trial 2 cleared the override with
+# ~222ms between the CLEAN=1 and CLEAN=0 writes, verified by a power-off that
+# held 203s afterwards. So the usual case costs a single round trip and leaves
+# almost no window in which a dropped connection could leave a clean running to
+# completion -- which would cause the very override being fixed. 3s is also
+# confirmed; 30s is headroom for a device that might need longer. A dwell that
+# does not work is invisible except that the setpoint is overridden again on the
+# next power-off, which is exactly when the next entry is tried.
 FIX_CLEAN_SECONDS = (0.0, 3.0, 30.0)
 
 # DEVICE_LOGS is a paging ring buffer of 6-byte records:

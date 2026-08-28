@@ -850,9 +850,12 @@ class OolerBLEDevice:
                 _LOGGER.warning("Device is off; clean cannot be stopped.")
                 self._state.clean = False
                 return
+        # Set before the write: the device's forced-setpoint notification
+        # arrives during the await, and a handler seeing this still false
+        # records the clean's own temperature as the user's choice.
+        self._state.clean = clean
         await self._write_gatt(CLEAN_CHAR, int(clean).to_bytes(1, "little"))
         _LOGGER.debug("Set clean to %s.", clean)
-        self._state.clean = clean
 
     async def fix_setpoint_override(
         self, setpoint: int | None = None, clean_seconds: float | None = None

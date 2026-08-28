@@ -1,8 +1,37 @@
 # Changelog
 
-## 1.1.0b6
+## 1.1.0b7
 
 Supersedes all earlier 1.1.0 betas. Use this one.
+
+### Fixed
+- **The clean's forced setpoint was still recorded as the user's choice.**
+  `set_clean` updated `state.clean` *after* awaiting the write, and the device
+  answers during that await — trial 2 logged its forced-setpoint notification in
+  the same millisecond as the write, ahead of the next statement. So the handler
+  ran with the flag still false and recorded 75 as a person's choice; the fix
+  then wrote 75 back and discarded the user's 85. Same harm as the original
+  finding C. The flag is now set before the write.
+
+  b5 removed the previous guard on the reasoning that `state.clean` could not be
+  stale because the device forces its temperature "a couple of seconds later."
+  That figure came from a poll observation, not notification timing. There is no
+  margin — the reply lands inside the await.
+
+### Verified on hardware (trial 2)
+- **The 0s first attempt is sufficient.** ~222ms between the `CLEAN=1` and
+  `CLEAN=0` writes cleared the override, confirmed independently by a power-off
+  that held 203s afterwards. Staying first in `FIX_CLEAN_SECONDS`.
+- The transition gating works: the clean's own power-off armed the watch.
+- Override delay 40.1s, against 26.0s in trial 1 — both inside the documented
+  3–60s range.
+
+### Still unverified
+- The 10s and 30s attempts, and `SETPOINT_OVERRIDE_UNFIXABLE`. Now unreachable
+  in ordinary testing, since 0s succeeds first; exercising them needs deliberate
+  fault injection.
+
+## 1.1.0b6
 
 ### Fixed
 - **Only a genuine on-to-off transition starts the override watch.** Any

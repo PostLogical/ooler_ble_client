@@ -2391,14 +2391,20 @@ class TestSetpointOverride:
         only be started by a connected client, so either we started it -- and
         set_clean set the flag first -- or another client holds the device's
         single connection and we are receiving nothing at all."""
-        device, _client = _make_connected_device(power=True)
+        device, client = _make_connected_device(power=True)
         await device.set_temperature(62)
-        await device.set_clean(True)
-        assert device._state.clean is True  # set before the device forces its own
 
-        device._notification_handler(
-            _make_sender(SETTEMP_CHAR), bytearray(bytes([CLEAN_TEMP_F]))
-        )
+        # The device answers during the write, not after it. A mock that
+        # returns first and notifies second tests an assumption rather than
+        # the hardware -- which is how this shipped in b6.
+        async def _forced_during_write(char: str, data: bytes, *_a: object) -> None:
+            if char == CLEAN_CHAR:
+                device._notification_handler(
+                    _make_sender(SETTEMP_CHAR), bytearray(bytes([CLEAN_TEMP_F]))
+                )
+
+        client.write_gatt_char = AsyncMock(side_effect=_forced_during_write)
+        await device.set_clean(True)
 
         assert device.state.set_temperature == CLEAN_TEMP_F  # reported faithfully
         assert device._last_user_setpoint == 62  # but not mistaken for intent
