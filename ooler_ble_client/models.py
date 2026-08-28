@@ -33,48 +33,22 @@ class ConnectionEventType(Enum):
     SUBSCRIPTION_MISMATCH = "subscription_mismatch"
     SUBSCRIPTION_RECOVERED = "subscription_recovered"
     FORCED_RECONNECT = "forced_reconnect"
-    #: The device was caught replacing the setpoint on its own after being
-    #: powered off -- see :meth:`OolerBLEDevice.clear_stuck_setpoint_bug`.
-    #: ``detail`` carries ``trigger``, ``wanted`` (the setpoint to end up at),
-    #: ``stuck_at`` and ``repaired`` (whether the client acted; ``False`` when
-    #: ``auto_clear_stuck_setpoint_bug`` is off, in which case nothing on the
-    #: device was changed).
-    #:
-    #: ``trigger`` is ``"clean_completed"`` when a deep clean finished, which is
-    #: known to arm the bug and is repaired at once rather than waiting for the
-    #: symptom -- ``stuck_at`` is ``None`` there, because nothing was
-    #: substituted yet. It is ``"observed"`` when the device was actually caught
-    #: substituting the setpoint, and ``stuck_at`` is what it used.
-    #:
-    #: Worth surfacing when ``repaired``: the repair briefly runs the pump and
-    #: moves the setpoint to ``CLEAN_TEMP_F``, which is otherwise unexplained in
-    #: a consumer's history.
-    STUCK_SETPOINT_DETECTED = "stuck_setpoint_detected"
-    #: Every duration in :data:`CLEAN_TOGGLE_SECONDS` has been tried, one per
-    #: stuck power-off, and the device keeps substituting the setpoint, so the
-    #: client has stopped trying. It keeps watching and will resume if the
-    #: device settles. Re-fires on each subsequent stuck power-off, so raising
-    #: the same issue repeatedly is idempotent. ``detail`` carries
-    #: ``consecutive`` (repairs that did not hold, so equal to the number of
-    #: durations available).
-    STUCK_SETPOINT_UNFIXABLE = "stuck_setpoint_unfixable"
-    #: A setpoint survived a full watch window with the device off after an
-    #: earlier repair, so the device is behaving again. Fires on the transition
-    #: only, not on every healthy power-off, so a consumer that raised something
-    #: user-facing on :attr:`STUCK_SETPOINT_UNFIXABLE` has an edge to clear it
-    #: on. ``detail`` carries ``after`` (repairs it took).
-    #:
-    #: Only fires when the observation was capable of showing a failure: if the
-    #: setpoint already equals the value the device substitutes, a repair that
-    #: did not take would have left exactly that, so nothing is claimed and the
-    #: next power-off at a different setpoint settles it.
-    #:
-    #: Note this also follows an ordinary successful repair, roughly one watch
-    #: window later: the repair ends by powering the device back off, which
-    #: starts a fresh watch that then survives. So the healthy path is
-    #: ``DETECTED{repaired: True}`` then ``RECOVERED{after: 1}``. Treat clearing
-    #: as idempotent -- it is a no-op when nothing was raised.
-    STUCK_SETPOINT_RECOVERED = "stuck_setpoint_recovered"
+    #: The device was caught overriding the setpoint after being powered off,
+    #: and a fix was applied -- see
+    #: :meth:`OolerBLEDevice.fix_setpoint_override`. ``detail`` carries
+    #: ``overrode`` (what the setpoint was), ``overrode_with`` (what the device
+    #: replaced it with), ``restored`` (what was written back, or ``None`` when
+    #: the device's own stored value was kept) and ``attempt``. Worth logging:
+    #: the fix briefly runs the pump and moves the setpoint to
+    #: :data:`CLEAN_TEMP_F`, which is otherwise unexplained in a consumer's
+    #: history. It does not need a person's attention.
+    SETPOINT_OVERRIDE_FIXED = "setpoint_override_fixed"
+    #: Every entry in :data:`FIX_CLEAN_SECONDS` has been tried and the device
+    #: keeps overriding the setpoint, so the client has stopped trying. Unlike
+    #: :attr:`SETPOINT_OVERRIDE_FIXED` this one does need a person: their
+    #: temperature is being discarded and nothing will correct it.
+    #: ``detail`` carries ``attempts``.
+    SETPOINT_OVERRIDE_UNFIXABLE = "setpoint_override_unfixable"
 
 
 @dataclass(frozen=True)

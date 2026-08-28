@@ -32,11 +32,11 @@ from .const import (
     POWER_CHAR,
     MODE_CHAR,
     SETTEMP_CHAR,
-    STUCK_SETPOINT_WATCH_SECONDS,
     ACTUALTEMP_CHAR,
     WATER_LEVEL_CHAR,
     CLEAN_CHAR,
-    CLEAN_TOGGLE_SECONDS,
+    FIX_CLEAN_SECONDS,
+    SETPOINT_OVERRIDE_WATCH_SECONDS,
     DISPLAY_TEMPERATURE_UNIT_CHAR,
     SCHEDULE_HEADER_CHAR,
     SCHEDULE_TIMES_CHAR,
@@ -99,16 +99,9 @@ def _is_valid_temp_f(temp_f: int) -> bool:
 
 class OolerBLEDevice:
 
-    def __init__(self, model: str, auto_clear_stuck_setpoint_bug: bool = True) -> None:
-        """Initialize the OolerBLEDevice.
-
-        ``auto_clear_stuck_setpoint_bug`` controls whether the client repairs a
-        device it catches substituting its own setpoint after being powered
-        off; see :meth:`clear_stuck_setpoint_bug`. Pass ``False`` to be told
-        about it instead and handle it yourself.
-        """
+    def __init__(self, model: str) -> None:
+        """Initialize the OolerBLEDevice."""
         self._model_id = model
-        self._auto_clear_stuck_setpoint_bug = auto_clear_stuck_setpoint_bug
         self._state = OolerBLEState()
         self._connect_lock = asyncio.Lock()
         self._client: BleakClientWithServiceCache | None = None
@@ -132,17 +125,18 @@ class OolerBLEDevice:
         # Indirection so tests can inject a fake monotonic clock without
         # globally patching time.monotonic.
         self._monotonic: Callable[[], float] = time.monotonic
-        # The setpoint the user actually asked for, as opposed to whatever the
-        # device currently reports. A clean forces the setpoint to CLEAN_TEMP_F
-        # for its duration, so the reported value is not a safe thing to restore.
-        self._commanded_setpoint: int | None = None
-        # The value the device last substituted. A watch that ends with the
-        # setpoint sitting on this value proves nothing, since a repair that did
-        # not take would have put the same number there.
-        self._last_stuck_at: int | None = None
-        # Stuck-setpoint repair; see _watch_for_stuck_setpoint.
-        self._stuck_setpoint_task: asyncio.Task[None] | None = None
-        self._stuck_setpoint_repairs: int = 0
+        # Setpoint override after a deep clean; see
+        # _watch_for_setpoint_override and CLEAN_TEMP_F in const.py.
+        #
+        # What a person last asked for, which is not the same as what the
+        # device currently reports: a clean forces the setpoint to CLEAN_TEMP_F
+        # for its duration, and the override replaces it outright. Exists so a
+        # fix can put back the right value.
+        self._last_user_setpoint: int | None = None
+        self._setpoint_override_watch: asyncio.Task[None] | None = None
+        self._override_fixes_tried: int = 0
+        # A clean this client started for a fix and has not yet stopped.
+        self._fix_started_clean: bool = False
 
     def set_ble_device(self, ble_device: BLEDevice) -> None:
         """Set the BLE Device."""
@@ -300,6 +294,15 @@ class OolerBLEDevice:
                 )
                 _LOGGER.debug("%s: Attempt to retrieve initial state.", self._model_id)
                 await self.async_poll()
+                if self._fix_started_clean:
+                    # A fix lost the link before stopping its clean. Letting it
+                    # finish would cause the override the fix was clearing.
+                    _LOGGER.warning(
+                        "%s: Stopping a clean left running by an interrupted fix.",
+                        self._model_id,
+                    )
+                    await self.set_clean(False)
+                    self._fix_started_clean = False
                 _LOGGER.debug("%s: Subscribe to notifications", self._model_id)
                 # Only subscribe to 4 notifications to stay within ESP32 proxy limits
                 # (12 global notification slots). Water level and clean are polled instead.
@@ -374,11 +377,6 @@ class OolerBLEDevice:
             changed = False
             if uuid == POWER_CHAR:
                 power = bool(int.from_bytes(data, "little"))
-                # A clean that ends by powering the device off ran to
-                # completion, which is what arms the bug. Polled rather than
-                # notified, so this can be missed -- the watch below still
-                # catches it, just not until the symptom appears.
-                after_clean = not power and bool(self._state.clean)
                 if self._state.power != power:
                     self._state.power = power
                     changed = True
@@ -387,11 +385,11 @@ class OolerBLEDevice:
                     self._state.clean = False
                     changed = True
                 if not power and (
-                    self._stuck_setpoint_task is None
-                    or self._stuck_setpoint_task.done()
+                    self._setpoint_override_watch is None
+                    or self._setpoint_override_watch.done()
                 ):
-                    self._stuck_setpoint_task = asyncio.create_task(
-                        self._watch_for_stuck_setpoint(after_clean=after_clean)
+                    self._setpoint_override_watch = asyncio.create_task(
+                        self._watch_for_setpoint_override()
                     )
             elif uuid == MODE_CHAR:
                 mode_int = int.from_bytes(data, "little")
@@ -417,9 +415,9 @@ class OolerBLEDevice:
                     self._state.set_temperature = set_temperature
                     changed = True
                     if self._state.power and not self._state.clean:
-                        # Someone asked for this: the device only changes the
-                        # setpoint by itself while cleaning or while off.
-                        self._commanded_setpoint = set_temperature
+                        # A person asked for this. The device changes the
+                        # setpoint by itself only while cleaning or while off.
+                        self._last_user_setpoint = set_temperature
             elif uuid == ACTUALTEMP_CHAR:
                 actualtemp_int = int.from_bytes(data, "little")
                 if self._state.actual_temperature != actualtemp_int:
@@ -805,10 +803,10 @@ class OolerBLEDevice:
             "Set temperature to %s (wrote %s°F to device).", settemp_int, settemp_f
         )
         self._state.set_temperature = settemp_int
-        self._commanded_setpoint = settemp_int
+        self._last_user_setpoint = settemp_int
 
     async def set_clean(self, clean: bool) -> None:
-        """Start or stop a clean cycle. Starting one powers the device on."""
+        """Start or stop a clean cycle. Automatically powers on the device."""
         if self._client is None:
             await self.connect()
         if self._client is None:
@@ -827,181 +825,109 @@ class OolerBLEDevice:
         _LOGGER.debug("Set clean to %s.", clean)
         self._state.clean = clean
 
-    async def clear_stuck_setpoint_bug(
-        self, setpoint: int | None = None, seconds: float | None = None
+    async def fix_setpoint_override(
+        self, setpoint: int | None = None, clean_seconds: float | None = None
     ) -> None:
-        """Work around the firmware bug that makes the setpoint snap back.
+        """Stop the device overriding the setpoint when it is powered off.
 
-        A deep clean run to completion leaves the device substituting a stored
-        temperature every time it is powered off, so anything set afterwards is
-        silently discarded. Starting a clean and cancelling it clears that; a
-        clean left to finish never can, because it ends by powering the device
-        off and so never sends ``CLEAN=0``. See CLEAN_TEMP_F in const.py.
+        A deep clean run to completion makes the device replace the setpoint
+        with a stored value every time it is powered off afterwards. Starting a
+        clean and cancelling it clears that; a clean left to finish never can,
+        because finishing ends by powering the device off and so never sends
+        ``CLEAN=0``. See CLEAN_TEMP_F in const.py.
 
-        Pass ``setpoint`` to leave the device at a particular temperature —
-        the device is already powered on at this point, so it is written for
-        real rather than deferred to the next power-on. Restores the power
-        state it found. Harmless on an unaffected device.
-
-        ``seconds`` is how long to leave the clean running; it defaults to the
-        longest entry in :data:`CLEAN_TOGGLE_SECONDS`, since a deliberate call
-        should favour working over finishing quickly.
+        Cancelling makes the device restore its stored setpoint by itself.
+        ``setpoint`` overwrites that afterwards; pass ``None`` to keep whatever
+        the device restored, which is the better answer when nothing else is
+        known. Leaves the device powered as it was found. Harmless on a device
+        that is not affected.
         """
         was_off = not self._state.power
-        await self.set_clean(True)
-        await asyncio.sleep(CLEAN_TOGGLE_SECONDS[-1] if seconds is None else seconds)
-        await self.set_clean(False)
+        self._fix_started_clean = True
+        try:
+            await self.set_clean(True)
+            await asyncio.sleep(
+                FIX_CLEAN_SECONDS[-1] if clean_seconds is None else clean_seconds
+            )
+        finally:
+            # Stop the clean even if the wait was interrupted. A clean left
+            # running finishes on its own, and finishing is what causes the
+            # override — the fix would become the cause. If this write fails
+            # too, the flag stays set and connect() finishes the job.
+            await self.set_clean(False)
+            self._fix_started_clean = False
         if setpoint is not None:
             await self.set_temperature(setpoint)
         if was_off:
             await self.set_power(False)
-        # Nobody asked for any of this, and the setters update state without
-        # notifying, so tell consumers where the device ended up.
+        # None of this was asked for, and the setters do not fire callbacks.
         self._fire_callbacks()
 
-    async def _watch_for_stuck_setpoint(self, after_clean: bool = False) -> None:
-        """After a power-off, repair the device if it moves the setpoint itself.
+    async def _watch_for_setpoint_override(self) -> None:
+        """After a power-off, fix the device if it overrides the setpoint.
 
-        ``after_clean`` means the power-off ended a deep clean, which is known
-        to arm the bug, so the repair runs at once instead of waiting for the
-        symptom. Waiting would cost the user a setting: the firmware restores
-        the pre-clean setpoint, so the first revert is invisible and the bug
-        does not bite until their next temperature change.
-
-        A setpoint change while the device stays off can only be the device's
-        own doing: it drops writes while off, and its single-connection limit
-        means nothing else can be writing while we hold the link. The delay is
-        variable — 3s to 60s observed — hence the generous window.
+        A setpoint change while the device stays off can only be the device
+        itself: it drops writes while off, its own buttons cannot change the
+        setpoint while off, and it accepts one connection at a time so nothing
+        else can be writing. Powering back on or losing the link mid-watch
+        proves nothing either way, so neither counts as evidence.
         """
-        # What the device reports now, used only to notice it changing.
-        baseline = self._state.set_temperature
-        # What to put back, which is not the same thing: on the power-off that
-        # ends a deep clean the reported value is the clean's forced
-        # CLEAN_TEMP_F, and restoring that would discard the user's setting.
-        wanted = (
-            baseline
-            if self._commanded_setpoint is None
-            else self._commanded_setpoint
-        )
-        deadline = self._monotonic() + STUCK_SETPOINT_WATCH_SECONDS
+        reported = self._state.set_temperature
+        deadline = self._monotonic() + SETPOINT_OVERRIDE_WATCH_SECONDS
         try:
-            if after_clean:
-                _LOGGER.info(
-                    "%s: Deep clean completed, which leaves the setpoint stuck; "
-                    "clearing it without waiting for the symptom.",
-                    self._model_id,
-                )
-                if self._auto_clear_stuck_setpoint_bug:
-                    await self.clear_stuck_setpoint_bug(
-                        setpoint=wanted, seconds=CLEAN_TOGGLE_SECONDS[0]
-                    )
-                self._fire_connection_event(
-                    ConnectionEventType.STUCK_SETPOINT_DETECTED,
-                    {
-                        "trigger": "clean_completed",
-                        "wanted": wanted,
-                        "stuck_at": None,
-                        "repaired": self._auto_clear_stuck_setpoint_bug,
-                    },
-                )
-                return
-            while self._state.set_temperature == baseline:
+            while self._state.set_temperature == reported:
                 if self._state.power:
-                    # Back in use before anything happened. Proves nothing
-                    # either way, so leave the failure count alone.
                     return
                 if self._monotonic() > deadline:
-                    # Setpoint survived a full window off, so any earlier
-                    # repair took: the device is behaving again.
-                    if baseline == self._last_stuck_at:
-                        # Except here: the setpoint already equals what the
-                        # device substitutes, so a repair that failed would
-                        # have left exactly this. Nothing was proved, so do not
-                        # claim recovery. The next power-off at a different
-                        # setpoint settles it.
-                        return
-                    if self._stuck_setpoint_repairs:
-                        after = self._stuck_setpoint_repairs
-                        self._stuck_setpoint_repairs = 0
-                        self._last_stuck_at = None
-                        self._fire_connection_event(
-                            ConnectionEventType.STUCK_SETPOINT_RECOVERED,
-                            {"after": after},
-                        )
+                    # Survived a full window off, so any earlier fix worked.
+                    self._override_fixes_tried = 0
                     return
                 await asyncio.sleep(1)
             if self._state.power:
-                # Powered back on as the device replaced the setpoint. Repairing
-                # now would start a clean cycle on a device someone is using;
-                # the next power-off will catch it.
+                # Powered back on as the device overrode the setpoint. Fixing
+                # now would run a clean on a device someone is using; the next
+                # power-off will catch it.
                 return
-            stuck_at = self._state.set_temperature
-            self._last_stuck_at = stuck_at
-            if not self._auto_clear_stuck_setpoint_bug:
-                # Told not to act, so report and stop. The failure count must
-                # not climb here: it records repairs that did not hold, and
-                # concluding "unfixable" from repairs never attempted would be
-                # a lie.
-                _LOGGER.info(
-                    "%s: Device replaced setpoint %s with %s while off; "
-                    "not repairing (auto_clear_stuck_setpoint_bug is off).",
-                    self._model_id,
-                    wanted,
-                    stuck_at,
-                )
-                self._fire_connection_event(
-                    ConnectionEventType.STUCK_SETPOINT_DETECTED,
-                    {
-                        "trigger": "observed",
-                        "wanted": wanted,
-                        "stuck_at": stuck_at,
-                        "repaired": False,
-                    },
-                )
-                return
-            attempt = self._stuck_setpoint_repairs
-            if attempt >= len(CLEAN_TOGGLE_SECONDS):
-                # Every duration has been tried and none held. Keep watching, but
-                # stop running the pump after every power-off to no effect.
+            overrode_with = self._state.set_temperature
+            attempt = self._override_fixes_tried
+            override = f"{reported} -> {overrode_with}"
+            if attempt >= len(FIX_CLEAN_SECONDS):
                 _LOGGER.warning(
-                    "%s: Setpoint still being replaced (%s -> %s) after trying "
-                    "%s; giving up until it settles.",
-                    self._model_id,
-                    wanted,
-                    stuck_at,
-                    CLEAN_TOGGLE_SECONDS,
+                    "%s: Setpoint still overridden (%s) after trying %s; giving "
+                    "up until it settles.",
+                    self._model_id, override, FIX_CLEAN_SECONDS,
                 )
                 self._fire_connection_event(
-                    ConnectionEventType.STUCK_SETPOINT_UNFIXABLE,
-                    {"consecutive": attempt},
+                    ConnectionEventType.SETPOINT_OVERRIDE_UNFIXABLE,
+                    {"attempts": attempt},
                 )
                 return
-            # Back off rather than repeating a duration that just failed. Count
-            # the attempt only here, so the counter stays "repairs that did not
-            # hold" rather than drifting into "times we noticed".
-            self._stuck_setpoint_repairs = attempt + 1
-            seconds = CLEAN_TOGGLE_SECONDS[attempt]
+            self._override_fixes_tried = attempt + 1
             _LOGGER.info(
-                "%s: Device replaced setpoint %s with %s while off; repairing "
-                "with a %gs clean.",
-                self._model_id,
-                wanted,
-                stuck_at,
-                seconds,
+                "%s: Device overrode setpoint while off (%s); fixing with a "
+                "%gs clean.",
+                self._model_id, override, FIX_CLEAN_SECONDS[attempt],
             )
-            await self.clear_stuck_setpoint_bug(setpoint=wanted, seconds=seconds)
+            # Only overwrite what the device restores if a person asked for
+            # something. On the first override after a clean the reported value
+            # is the clean's forced CLEAN_TEMP_F, while the device's own stored
+            # value is the pre-clean setpoint — which is the better answer.
+            await self.fix_setpoint_override(
+                setpoint=self._last_user_setpoint,
+                clean_seconds=FIX_CLEAN_SECONDS[attempt],
+            )
             self._fire_connection_event(
-                ConnectionEventType.STUCK_SETPOINT_DETECTED,
+                ConnectionEventType.SETPOINT_OVERRIDE_FIXED,
                 {
-                    "trigger": "observed",
-                    "wanted": wanted,
-                    "stuck_at": stuck_at,
-                    "repaired": True,
+                    "overrode": reported,
+                    "overrode_with": overrode_with,
+                    "restored": self._last_user_setpoint,
+                    "attempt": attempt + 1,
                 },
             )
         except Exception as err:  # noqa: BLE001 - background task, nothing to raise to
             _LOGGER.warning(
-                "%s: Failed to clear the stuck-setpoint bug: %s", self._model_id, err
+                "%s: Could not fix the setpoint override: %s", self._model_id, err
             )
 
     async def set_temperature_unit(self, unit: TemperatureUnit) -> None:
@@ -1220,11 +1146,10 @@ class OolerBLEDevice:
 
     async def _execute_disconnect(self) -> None:
         """Execute disconnection."""
-        if self._stuck_setpoint_task is not None:
-            # Outlives the connection otherwise: it waits minutes for the
-            # device to move the setpoint, and repairing needs the link.
-            self._stuck_setpoint_task.cancel()
-            self._stuck_setpoint_task = None
+        if self._setpoint_override_watch is not None:
+            # Outlives the connection otherwise, and fixing needs the link.
+            self._setpoint_override_watch.cancel()
+            self._setpoint_override_watch = None
         async with self._connect_lock:
             client = self._client
             self._expected_disconnect = True

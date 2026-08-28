@@ -20,7 +20,7 @@ from ooler_ble_client import (
 )
 from ooler_ble_client.const import (
     CLEAN_TEMP_F,
-    CLEAN_TOGGLE_SECONDS,
+    FIX_CLEAN_SECONDS,
     MODE_INT_TO_MODE_STATE,
     POWER_CHAR,
     MODE_CHAR,
@@ -55,31 +55,30 @@ _TEMP_UNIT_F = b"\x00"
 _TEMP_UNIT_C = b"\x01"
 
 
-def _make_sender(uuid: str) -> MagicMock:
-    sender = MagicMock()
-    sender.uuid = uuid
-    return sender
-
-
 @contextmanager
-def _window_already_expired() -> Iterator[None]:
-    """Make the stuck-setpoint watch time out immediately.
+def _watch_window_expired() -> Iterator[None]:
+    """Make the setpoint-override watch time out on its first check.
 
-    A negative window puts the deadline in the past, so the watch gives up on
-    its first check. Simpler and less brittle than feeding a fake clock, which
-    would have to match the number of internal monotonic() calls.
+    A negative window puts the deadline in the past. Simpler than a fake clock,
+    which would have to match how many times the code reads it.
     """
-    with patch("ooler_ble_client.client.STUCK_SETPOINT_WATCH_SECONDS", new=-1):
+    with patch("ooler_ble_client.client.SETPOINT_OVERRIDE_WATCH_SECONDS", new=-1):
         yield
 
 
-async def _cancel_stuck_setpoint_watch(device: OolerBLEDevice) -> None:
-    """Cancel the watch a power-off notification starts, if any."""
-    task = device._stuck_setpoint_task
+async def _finish_override_watch(device: OolerBLEDevice) -> None:
+    """Await the watch a power-off notification starts, if any."""
+    task = device._setpoint_override_watch
     if task is not None:
         task.cancel()
         with suppress(asyncio.CancelledError):
             await task
+
+
+def _make_sender(uuid: str) -> MagicMock:
+    sender = MagicMock()
+    sender.uuid = uuid
+    return sender
 
 
 def _make_connected_device(
@@ -231,9 +230,9 @@ class TestNotificationHandler:
         )
         assert device.state.power is True
 
-    # Power-off starts the stuck-setpoint watch, which needs a running loop
-    # (bleak always delivers notifications on one). Cancel it so it does not
-    # outlive the test.
+    # A power-off starts the setpoint-override watch, which needs a running
+    # loop (bleak always delivers notifications on one). Finish it so it does
+    # not outlive the test.
     @pytest.mark.asyncio
     async def test_power_off_clears_clean(self) -> None:
         device = OolerBLEDevice(model="OOLER-TEST")
@@ -243,7 +242,7 @@ class TestNotificationHandler:
         )
         assert device.state.power is False
         assert device.state.clean is False
-        await _cancel_stuck_setpoint_watch(device)
+        await _finish_override_watch(device)
 
     @pytest.mark.asyncio
     async def test_power_off_no_callback_if_clean_already_false(self) -> None:
@@ -256,7 +255,7 @@ class TestNotificationHandler:
             _make_sender(POWER_CHAR), bytearray(b"\x00")
         )
         assert len(received) == 0
-        await _cancel_stuck_setpoint_watch(device)
+        await _finish_override_watch(device)
 
     def test_mode(self) -> None:
         device = OolerBLEDevice(model="OOLER-TEST")
@@ -2131,64 +2130,119 @@ class TestSyncClock:
             await device.sync_clock()
 
 
-class TestStuckSetpointBug:
-    """The firmware substitutes a stored setpoint after a completed deep clean.
-
-    See clear_stuck_setpoint_bug and CLEAN_TEMP_F in const.py.
-    """
+class TestSetpointOverride:
+    """A deep clean run to completion makes the device override the setpoint on
+    every later power-off. See CLEAN_TEMP_F in const.py."""
 
     @pytest.mark.asyncio
-    async def test_clear_toggles_clean_and_restores_power(self) -> None:
+    async def test_fix_toggles_clean_and_leaves_power_as_found(self) -> None:
         device, client = _make_connected_device(power=False)
         with patch("asyncio.sleep", AsyncMock()):
-            await device.clear_stuck_setpoint_bug()
+            await device.fix_setpoint_override()
         written = [c.args[1] for c in client.write_gatt_char.call_args_list]
-        # on, clean on, clean off, off again
-        assert written[0] == b"\x01"  # POWER on (clean needs the device running)
-        assert b"\x01" in written and b"\x00" in written
-        assert written[-1] == b"\x00"  # POWER back off
+        assert written[0] == b"\x01"   # on: a clean needs the device running
+        assert written[-1] == b"\x00"  # and back off
         assert device.state.power is False
 
     @pytest.mark.asyncio
-    async def test_clear_leaves_requested_setpoint(self) -> None:
+    async def test_fix_keeps_the_devices_own_value_when_none_given(self) -> None:
+        """Cancelling makes the device restore its stored setpoint. With nothing
+        better known that is the right answer, so do not overwrite it."""
         device, client = _make_connected_device(power=True)
+        device._state.set_temperature = 85
         with patch("asyncio.sleep", AsyncMock()):
-            await device.clear_stuck_setpoint_bug(setpoint=62)
-        assert device.state.set_temperature == 62
-        assert device.state.power is True  # was on; left on
+            await device.fix_setpoint_override()
+        assert SETTEMP_CHAR not in [c.args[0] for c in client.write_gatt_char.call_args_list]
 
     @pytest.mark.asyncio
-    async def test_stopping_clean_while_off_does_not_power_on(self) -> None:
+    async def test_fix_tells_consumers_where_the_device_ended_up(self) -> None:
+        """The fix moves power and setpoint unasked, and the setters do not fire
+        callbacks, so without this a consumer's view stays stale."""
+        device, _client = _make_connected_device(power=False)
+        seen: list[OolerBLEState] = []
+        device.register_callback(seen.append)
+        with patch("asyncio.sleep", AsyncMock()):
+            await device.fix_setpoint_override(setpoint=62)
+        assert seen[-1].power is False
+        assert seen[-1].set_temperature == 62
+
+    @pytest.mark.asyncio
+    async def test_stopping_a_clean_does_not_wake_the_device(self) -> None:
         device, client = _make_connected_device(power=False)
         device._state.clean = True
         await device.set_clean(False)
         client.write_gatt_char.assert_not_called()
-        assert device.state.clean is False
         assert device.state.power is False
 
     @pytest.mark.asyncio
-    async def test_watch_repairs_when_device_moves_setpoint_while_off(self) -> None:
-        device, client = _make_connected_device(power=False)
-        device._state.set_temperature = 62
+    async def test_override_while_off_is_fixed_and_the_setpoint_restored(self) -> None:
+        device, _client = _make_connected_device(power=True)
+        await device.set_temperature(62)
+        device._state.power = False
         events: list[ConnectionEvent] = []
         device.register_connection_event_callback(events.append)
 
-        async def _device_substitutes(_delay: float) -> None:
-            device._state.set_temperature = 71  # the device, not us
+        async def _device_overrides(_delay: float) -> None:
+            device._state.set_temperature = 71
 
-        with patch("asyncio.sleep", AsyncMock(side_effect=_device_substitutes)):
-            await device._watch_for_stuck_setpoint()
+        with patch("asyncio.sleep", AsyncMock(side_effect=_device_overrides)):
+            await device._watch_for_setpoint_override()
 
         assert [e.type for e in events] == [
-            ConnectionEventType.STUCK_SETPOINT_DETECTED
+            ConnectionEventType.SETPOINT_OVERRIDE_FIXED
         ]
-        assert events[0].detail == {"trigger": "observed", "wanted": 62, "stuck_at": 71, "repaired": True}
-        # Repaired back to what was asked for, not what the device substituted.
+        assert events[0].detail == {
+            "overrode": 62, "overrode_with": 71, "restored": 62, "attempt": 1,
+        }
         assert device.state.set_temperature == 62
 
     @pytest.mark.asyncio
-    async def test_watch_does_nothing_if_device_powers_back_on(self) -> None:
+    async def test_restores_the_users_setpoint_not_the_cleans_forced_one(self) -> None:
+        """The clean holds the setpoint at CLEAN_TEMP_F, and the power-off that
+        ends it is also the first override. So the reported value at that moment
+        is the clean's artifact -- restoring it would discard what the user set.
+        Field trial 2026-08-27: user set 85, clean forced 75, firmware overrode
+        with 85, and an earlier version wrote 75 back."""
+        device, _client = _make_connected_device(power=True)
+        await device.set_temperature(85)
+        device._state.clean = True
+        device._notification_handler(
+            _make_sender(SETTEMP_CHAR), bytearray(bytes([CLEAN_TEMP_F]))
+        )
+        device._state.clean = False
+        device._state.power = False
+
+        async def _device_overrides(_delay: float) -> None:
+            device._state.set_temperature = 85
+
+        with patch("asyncio.sleep", AsyncMock(side_effect=_device_overrides)):
+            await device._watch_for_setpoint_override()
+
+        assert device.state.set_temperature == 85
+
+    @pytest.mark.asyncio
+    async def test_nothing_is_written_when_no_user_setpoint_is_known(self) -> None:
+        """Connected mid-clean, never saw a request. The device's stored value
+        is the pre-clean setpoint, which beats the clean's forced one."""
+        device, _client = _make_connected_device(power=False)
+        device._state.set_temperature = CLEAN_TEMP_F
+        device._last_user_setpoint = None
+        set_temperature = AsyncMock()
+
+        async def _device_overrides(_delay: float) -> None:
+            device._state.set_temperature = 85
+
+        with patch.object(device, "set_temperature", set_temperature), patch(
+            "asyncio.sleep", AsyncMock(side_effect=_device_overrides)
+        ):
+            await device._watch_for_setpoint_override()
+
+        set_temperature.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_powering_back_on_is_not_evidence_either_way(self) -> None:
         device, client = _make_connected_device(power=False)
+        device._override_fixes_tried = 2
         events: list[ConnectionEvent] = []
         device.register_connection_event_callback(events.append)
 
@@ -2196,336 +2250,134 @@ class TestStuckSetpointBug:
             device._state.power = True
 
         with patch("asyncio.sleep", AsyncMock(side_effect=_powered_on)):
-            await device._watch_for_stuck_setpoint()
+            await device._watch_for_setpoint_override()
 
         assert events == []
+        assert device._override_fixes_tried == 2  # unchanged: nothing was shown
         client.write_gatt_char.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_watch_gives_up_after_the_window(self) -> None:
+    async def test_surviving_the_window_clears_the_attempt_count(self) -> None:
         device, _client = _make_connected_device(power=False)
-        events: list[ConnectionEvent] = []
-        device.register_connection_event_callback(events.append)
-        with _window_already_expired(), patch("asyncio.sleep", AsyncMock()):
-            await device._watch_for_stuck_setpoint()
-        assert events == []
+        device._override_fixes_tried = 2
+        with _watch_window_expired(), patch("asyncio.sleep", AsyncMock()):
+            await device._watch_for_setpoint_override()
+        assert device._override_fixes_tried == 0
 
     @pytest.mark.asyncio
-    async def test_auto_disabled_reports_without_repairing(self) -> None:
-        device, client = _make_connected_device(power=False)
-        device._auto_clear_stuck_setpoint_bug = False
-        device._state.set_temperature = 62
+    async def test_each_attempt_uses_the_next_dwell_then_gives_up(self) -> None:
+        """Repeating a dwell that just failed would waste the whole budget."""
+        device, _client = _make_connected_device(power=False)
+        used: list[float] = []
         events: list[ConnectionEvent] = []
         device.register_connection_event_callback(events.append)
 
-        async def _device_substitutes(_delay: float) -> None:
+        async def _record(**kwargs: object) -> None:
+            used.append(kwargs["clean_seconds"])  # type: ignore[arg-type]
+
+        async def _device_overrides(_delay: float) -> None:
             device._state.set_temperature = 71
 
-        with patch("asyncio.sleep", AsyncMock(side_effect=_device_substitutes)):
-            await device._watch_for_stuck_setpoint()
+        with patch.object(device, "fix_setpoint_override", _record):
+            for _ in range(len(FIX_CLEAN_SECONDS) + 1):
+                device._state.set_temperature = 62
+                with patch(
+                    "asyncio.sleep", AsyncMock(side_effect=_device_overrides)
+                ):
+                    await device._watch_for_setpoint_override()
 
-        # Reports what it saw without claiming to have repaired anything, and
-        # leaves the failure count alone -- concluding "unfixable" from repairs
-        # that were never attempted would be a lie.
-        assert [e.type for e in events] == [
-            ConnectionEventType.STUCK_SETPOINT_DETECTED
-        ]
-        assert events[0].detail == {"trigger": "observed", "wanted": 62, "stuck_at": 71, "repaired": False}
-        assert device._stuck_setpoint_repairs == 0
-        client.write_gatt_char.assert_not_called()
+        assert used == list(FIX_CLEAN_SECONDS)
+        assert [e.type for e in events][-1] == (
+            ConnectionEventType.SETPOINT_OVERRIDE_UNFIXABLE
+        )
+        assert events[-1].detail == {"attempts": len(FIX_CLEAN_SECONDS)}
 
     @pytest.mark.asyncio
-    async def test_watch_logs_and_survives_a_failed_repair(self) -> None:
-        device, client = _make_connected_device(power=False)
-        device._state.set_temperature = 62
-        client.write_gatt_char = AsyncMock(side_effect=BleakError("gone"))
+    async def test_a_change_made_while_running_counts_as_the_users(self) -> None:
+        """Changed at the unit or in the app -- ours to preserve."""
+        device, _client = _make_connected_device(power=True)
+        device._notification_handler(_make_sender(SETTEMP_CHAR), bytearray(b"\x3e"))
+        assert device._last_user_setpoint == 62
 
-        async def _device_substitutes(_delay: float) -> None:
-            device._state.set_temperature = 71
+    @pytest.mark.asyncio
+    async def test_a_clean_the_fix_could_not_stop_stays_flagged(self) -> None:
+        """A clean left running finishes on its own, and finishing is what
+        causes the override -- the fix would become the cause. The flag is what
+        lets the next connection finish the job."""
+        device, _client = _make_connected_device(power=True)
 
-        with patch("asyncio.sleep", AsyncMock(side_effect=_device_substitutes)):
-            # Runs as a background task in production, so it must never raise.
-            await device._watch_for_stuck_setpoint()
+        async def _clean(clean: bool) -> None:
+            if not clean:
+                raise BleakError("link gone")
+
+        with patch.object(device, "set_clean", _clean), patch(
+            "asyncio.sleep", AsyncMock()
+        ), suppress(BleakError):
+            await device.fix_setpoint_override()
+
+        assert device._fix_started_clean is True
 
     @pytest.mark.asyncio
     async def test_disconnect_cancels_the_watch(self) -> None:
         device, _client = _make_connected_device(power=False)
         device._notification_handler(_make_sender(POWER_CHAR), bytearray(b"\x00"))
-        task = device._stuck_setpoint_task
+        task = device._setpoint_override_watch
         assert task is not None
         await device.stop()
-        assert device._stuck_setpoint_task is None
+        assert device._setpoint_override_watch is None
         with suppress(asyncio.CancelledError):
             await task
         assert task.cancelled()
 
     @pytest.mark.asyncio
-    async def test_gives_up_when_repairs_stop_working(self) -> None:
-        device, client = _make_connected_device(power=False)
-        events: list[ConnectionEvent] = []
-        device.register_connection_event_callback(events.append)
-
-        async def _device_substitutes(_delay: float) -> None:
-            device._state.set_temperature = 71
-
-        # Every power-off finds the setpoint replaced again: the repair is not
-        # sticking, e.g. CLEAN_TOGGLE_SECONDS too short for this device.
-        for _ in range(len(CLEAN_TOGGLE_SECONDS) + 1):
-            device._state.set_temperature = 62
-            with patch("asyncio.sleep", AsyncMock(side_effect=_device_substitutes)):
-                await device._watch_for_stuck_setpoint()
-
-        assert [e.type for e in events] == (
-            [ConnectionEventType.STUCK_SETPOINT_DETECTED] * len(CLEAN_TOGGLE_SECONDS)
-            + [ConnectionEventType.STUCK_SETPOINT_UNFIXABLE]
-        )
-        # Reports the durations actually tried, and does not keep climbing on
-        # further stuck power-offs where no repair is attempted.
-        assert events[-1].detail == {"consecutive": len(CLEAN_TOGGLE_SECONDS)}
-        assert device._stuck_setpoint_repairs == len(CLEAN_TOGGLE_SECONDS)
-
-        device._state.set_temperature = 62
-        with patch("asyncio.sleep", AsyncMock(side_effect=_device_substitutes)):
-            await device._watch_for_stuck_setpoint()
-        assert events[-1].detail == {"consecutive": len(CLEAN_TOGGLE_SECONDS)}
-        assert device._stuck_setpoint_repairs == len(CLEAN_TOGGLE_SECONDS)
-
-    @pytest.mark.asyncio
-    async def test_quick_power_cycle_does_not_reset_failure_count(self) -> None:
-        """Turning the device straight back on proves nothing, so it must not
-        wipe the record of repairs that were not sticking."""
-        device, _client = _make_connected_device(power=False)
-        device._stuck_setpoint_repairs = 2
-
-        async def _powered_on(_delay: float) -> None:
-            device._state.power = True
-
-        with patch("asyncio.sleep", AsyncMock(side_effect=_powered_on)):
-            await device._watch_for_stuck_setpoint()
-
-        assert device._stuck_setpoint_repairs == 2
-
-    @pytest.mark.asyncio
-    async def test_no_repair_if_powered_on_as_the_setpoint_is_replaced(self) -> None:
-        """Repairing here would start a clean cycle on a device in use."""
-        device, client = _make_connected_device(power=False)
-        device._state.set_temperature = 62
-        events: list[ConnectionEvent] = []
-        device.register_connection_event_callback(events.append)
-
-        async def _substituted_and_powered_on(_delay: float) -> None:
-            device._state.set_temperature = 71
-            device._state.power = True
-
-        with patch(
-            "asyncio.sleep", AsyncMock(side_effect=_substituted_and_powered_on)
-        ):
-            await device._watch_for_stuck_setpoint()
-
-        assert events == []
-        client.write_gatt_char.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_repair_backs_off_instead_of_repeating_a_failed_duration(self) -> None:
-        """Each attempt uses the next, longer clean duration -- repeating one
-        that just failed would waste the whole retry budget."""
-        device, _client = _make_connected_device(power=False)
-        used: list[float] = []
-
-        async def _record(**kwargs: object) -> None:
-            used.append(kwargs["seconds"])  # type: ignore[arg-type]
-
-        async def _device_substitutes(_delay: float) -> None:
-            device._state.set_temperature = 71
-
-        with patch.object(device, "clear_stuck_setpoint_bug", _record):
-            for _ in range(len(CLEAN_TOGGLE_SECONDS)):
-                device._state.set_temperature = 62
-                with patch(
-                    "asyncio.sleep", AsyncMock(side_effect=_device_substitutes)
-                ):
-                    await device._watch_for_stuck_setpoint()
-
-        assert used == list(CLEAN_TOGGLE_SECONDS)
-
-    @pytest.mark.asyncio
-    async def test_manual_repair_uses_the_most_proven_duration(self) -> None:
-        device, _client = _make_connected_device(power=True)
-        slept: list[float] = []
-
-        async def _record_sleep(delay: float) -> None:
-            slept.append(delay)
-
-        with patch("asyncio.sleep", _record_sleep):
-            await device.clear_stuck_setpoint_bug()
-        assert CLEAN_TOGGLE_SECONDS[-1] in slept
-
-    @pytest.mark.asyncio
-    async def test_recovery_is_announced_so_consumers_can_clear_warnings(self) -> None:
-        """A consumer that raised something user-facing on UNFIXABLE needs an
-        edge to clear it on."""
-        device, _client = _make_connected_device(power=False)
-        device._stuck_setpoint_repairs = 4
-        events: list[ConnectionEvent] = []
-        device.register_connection_event_callback(events.append)
-        with _window_already_expired(), patch("asyncio.sleep", AsyncMock()):
-            await device._watch_for_stuck_setpoint()
-
-        assert [e.type for e in events] == [
-            ConnectionEventType.STUCK_SETPOINT_RECOVERED
-        ]
-        assert events[0].detail == {"after": 4}
-        assert device._stuck_setpoint_repairs == 0
-
-    @pytest.mark.asyncio
-    async def test_healthy_power_offs_do_not_announce_recovery(self) -> None:
-        """Nothing was wrong, so there is nothing to recover from."""
-        device, _client = _make_connected_device(power=False)
-        events: list[ConnectionEvent] = []
-        device.register_connection_event_callback(events.append)
-        with _window_already_expired(), patch("asyncio.sleep", AsyncMock()):
-            await device._watch_for_stuck_setpoint()
-
-        assert events == []
-
-    @pytest.mark.asyncio
-    async def test_restores_the_users_setpoint_not_the_cleans_forced_one(self) -> None:
-        """Field trial 2026-08-27: user set 85, the clean forced 75, the
-        firmware reverted to 85, and the repair wrote 75 -- silently discarding
-        the setting. The clean's terminating power-off is both what arms the bug
-        and what triggers the first detection, so this is the path a real user
-        hits first."""
-        device, client = _make_connected_device(power=True)
-        await device.set_temperature(85)          # what the user asked for
-        device._state.clean = True
-        device._notification_handler(              # clean forces its own temp
-            _make_sender(SETTEMP_CHAR), bytearray(bytes([CLEAN_TEMP_F]))
-        )
-        assert device.state.set_temperature == CLEAN_TEMP_F
-        device._state.clean = False
-        device._state.power = False
-        events: list[ConnectionEvent] = []
-        device.register_connection_event_callback(events.append)
-
-        async def _firmware_reverts(_delay: float) -> None:
-            device._state.set_temperature = 85     # the pre-clean setpoint
-
-        with patch("asyncio.sleep", AsyncMock(side_effect=_firmware_reverts)):
-            await device._watch_for_stuck_setpoint()
-
-        assert events[0].detail == {"trigger": "observed", "wanted": 85, "stuck_at": 85, "repaired": True}
-        assert device.state.set_temperature == 85
-
-    @pytest.mark.asyncio
-    async def test_externally_set_temperature_counts_as_the_users_intent(self) -> None:
-        """Changed at the unit or in the app while running -- ours to preserve."""
-        device, _client = _make_connected_device(power=True)
-        device._notification_handler(
-            _make_sender(SETTEMP_CHAR), bytearray(b"\x3e")  # 62
-        )
-        assert device._commanded_setpoint == 62
-
-    @pytest.mark.asyncio
-    async def test_repair_tells_consumers_where_the_device_ended_up(self) -> None:
-        """The repair powers the device on and off without being asked; the
-        setters update state silently, so without this a consumer's entity
-        stays stale until something else polls."""
-        device, _client = _make_connected_device(power=False)
-        states: list[OolerBLEState] = []
-        device.register_callback(states.append)
-        with patch("asyncio.sleep", AsyncMock()):
-            await device.clear_stuck_setpoint_bug(setpoint=62)
-        assert states and states[-1].power is False
-        assert states[-1].set_temperature == 62
-
-    @pytest.mark.asyncio
-    async def test_no_recovery_claim_when_nothing_could_have_been_observed(self) -> None:
-        """After the post-clean repair the setpoint equals the value the device
-        substitutes, so a repair that failed would have left exactly the same
-        number. Claiming recovery there would be asserting an unverified fix."""
-        device, _client = _make_connected_device(power=False)
-        device._state.set_temperature = 85
-        device._last_stuck_at = 85
-        device._stuck_setpoint_repairs = 1
-        events: list[ConnectionEvent] = []
-        device.register_connection_event_callback(events.append)
-
-        with _window_already_expired(), patch("asyncio.sleep", AsyncMock()):
-            await device._watch_for_stuck_setpoint()
-
-        assert events == []
-        assert device._stuck_setpoint_repairs == 1
-
-    @pytest.mark.asyncio
-    async def test_recovery_is_claimed_once_a_failure_would_have_shown(self) -> None:
-        device, _client = _make_connected_device(power=False)
-        device._state.set_temperature = 62      # differs from what it substitutes
-        device._last_stuck_at = 85
-        device._stuck_setpoint_repairs = 1
-        events: list[ConnectionEvent] = []
-        device.register_connection_event_callback(events.append)
-
-        with _window_already_expired(), patch("asyncio.sleep", AsyncMock()):
-            await device._watch_for_stuck_setpoint()
-
-        assert [e.type for e in events] == [
-            ConnectionEventType.STUCK_SETPOINT_RECOVERED
-        ]
-        assert device._last_stuck_at is None
-
-    @pytest.mark.asyncio
-    async def test_completed_clean_is_repaired_without_waiting_for_the_symptom(
+    async def test_no_fix_if_the_device_is_back_on_when_the_override_lands(
         self,
     ) -> None:
-        """A completed clean is known to arm the bug. Waiting for the symptom
-        costs the user a setting, since the firmware restores the pre-clean
-        setpoint and the bug does not bite until their next change."""
-        device, client = _make_connected_device(power=True)
-        await device.set_temperature(85)
-        device._state.clean = True
+        """Fixing here would run a clean on a device someone is using."""
+        device, _client = _make_connected_device(power=False)
+        device._state.set_temperature = 62
         events: list[ConnectionEvent] = []
         device.register_connection_event_callback(events.append)
+        fix = AsyncMock()
 
-        with patch("asyncio.sleep", AsyncMock()):
-            device._notification_handler(
-                _make_sender(POWER_CHAR), bytearray(b"\x00")
-            )
-            task = device._stuck_setpoint_task
-            assert task is not None
-            await task
+        async def _overridden_and_powered_on(_delay: float) -> None:
+            device._state.set_temperature = 71
+            device._state.power = True
 
-        assert [e.type for e in events] == [
-            ConnectionEventType.STUCK_SETPOINT_DETECTED
-        ]
-        assert events[0].detail == {
-            "trigger": "clean_completed",
-            "wanted": 85,
-            "stuck_at": None,
-            "repaired": True,
-        }
+        with patch.object(device, "fix_setpoint_override", fix), patch(
+            "asyncio.sleep", AsyncMock(side_effect=_overridden_and_powered_on)
+        ):
+            await device._watch_for_setpoint_override()
+
+        fix.assert_not_called()
+        assert events == []
 
     @pytest.mark.asyncio
-    async def test_completed_clean_reports_without_acting_when_opted_out(self) -> None:
-        device, client = _make_connected_device(power=True)
-        device._auto_clear_stuck_setpoint_bug = False
-        await device.set_temperature(85)
-        device._state.clean = True
-        client.write_gatt_char.reset_mock()
-        events: list[ConnectionEvent] = []
-        device.register_connection_event_callback(events.append)
+    async def test_a_failing_fix_is_logged_not_raised(self) -> None:
+        """It runs as a background task, so there is nothing to raise to."""
+        device, _client = _make_connected_device(power=False)
+        device._state.set_temperature = 62
 
-        with patch("asyncio.sleep", AsyncMock()):
-            device._notification_handler(
-                _make_sender(POWER_CHAR), bytearray(b"\x00")
-            )
-            task = device._stuck_setpoint_task
-            assert task is not None
-            await task
+        async def _device_overrides(_delay: float) -> None:
+            device._state.set_temperature = 71
 
-        assert events[0].detail == {
-            "trigger": "clean_completed",
-            "wanted": 85,
-            "stuck_at": None,
-            "repaired": False,
-        }
-        client.write_gatt_char.assert_not_called()
+        with patch.object(
+            device, "fix_setpoint_override", AsyncMock(side_effect=BleakError("gone"))
+        ), patch("asyncio.sleep", AsyncMock(side_effect=_device_overrides)):
+            await device._watch_for_setpoint_override()
+
+    @pytest.mark.asyncio
+    async def test_connecting_stops_a_clean_an_interrupted_fix_left_running(
+        self,
+    ) -> None:
+        mock_client = _make_mock_client()
+        device = OolerBLEDevice(model="OOLER-TEST")
+        device.set_ble_device(MagicMock())
+        device._fix_started_clean = True
+        with _patch_establish(mock_client):
+            await device.connect()
+        assert device._fix_started_clean is False
+        assert CLEAN_CHAR in [
+            c.args[0] for c in mock_client.write_gatt_char.call_args_list
+        ]
+        await _finish_override_watch(device)

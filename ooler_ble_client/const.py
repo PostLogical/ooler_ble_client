@@ -126,42 +126,43 @@ SCHEDULE_META_CHAR = "fa242bc0-bf85-41f7-8dbb-53ba2e8b08a3"  # read-only; firmwa
 UNKNOWN_2AAA_CHAR = "00002aaa-0000-1000-8000-00805f9b34fb"  # read/write/notify; always 0x0000
 
 # ---------------------------------------------------------------------------
-# Setpoint-restore ("magic temperature") behaviour -- firmware 15.20
+# Setpoint override after a deep clean -- firmware 15.20
 # ---------------------------------------------------------------------------
 #
 # A deep clean run TO COMPLETION commits the device's current setpoint into
-# non-volatile storage and enables restore-on-power-off: from then on, whenever
-# the unit is powered off, SET_TEMP snaps back to that stored value after a
-# delay. The delay is highly variable -- 3s to 60s observed -- so any check for
-# this behaviour needs a window of minutes, not seconds.
+# non-volatile storage. From then on the device overrides the setpoint every
+# time it is powered off, replacing it with that stored value, so anything set
+# afterwards is silently discarded.
 #
 # Starting a clean and CANCELLING it before it completes clears the behaviour.
-# CLEAN=1 forces SET_TEMP to CLEAN_TEMP_F; CLEAN=0 restores from the stored slot
-# and leaves it tracking live values again.
+# CLEAN=1 forces SET_TEMP to CLEAN_TEMP_F while the clean runs; CLEAN=0 makes
+# the device restore its stored setpoint by itself.
 #
 # A completed clean can never fix what it causes: completion ends by powering
-# the device off, so CLEAN=0 is never sent and the restore path never runs.
+# the device off, so CLEAN=0 is never sent.
 #
-# Reproduced in both directions on two devices (2026-08-26), armed via Home
-# Assistant on one and the official app on the other, so this is device
-# firmware and not a client behaviour.
+# Reproduced in both directions on two devices (2026-08-26), triggered from
+# Home Assistant, the vendor's app and this library, so it is device firmware
+# rather than any client's doing.
 CLEAN_TEMP_F = 75
 
-# How long after a power-off to watch for the restore before concluding the
-# device is not armed. Longest observed delay was 60s; this is double that.
-STUCK_SETPOINT_WATCH_SECONDS = 120.0
+# How long after a power-off to watch before concluding the device is behaving.
+# The override lands 3s to 60s after power-off with no pattern we can find --
+# seven of eight measurements were 12s or longer, one was 3s. This is double the
+# slowest seen.
+SETPOINT_OVERRIDE_WATCH_SECONDS = 120.0
 
-# How long to leave the clean running before cancelling it, per attempt.
+# How long to leave the fix's clean running before cancelling it, one entry per
+# attempt; running out of entries is what gives up.
 #
-# The device reports clean mode within ~2s (CLEAN=1, SET_TEMP=CLEAN_TEMP_F), and
-# whether clearing needs any dwell beyond the CLEAN 1->0 transition is unknown.
-# 3s is confirmed on hardware and 20s by hand; the rest is headroom. Try the
-# cheap value first and back
-# off: a repair that does nothing is invisible except that the setpoint is
-# replaced again on the next power-off, which is exactly when the next attempt
-# fires. Running out of entries means giving up (STUCK_SETPOINT_UNFIXABLE)
-# rather than running the pump after every power-off forever.
-CLEAN_TOGGLE_SECONDS = (3.0, 10.0, 30.0)
+# Nothing is tried first. If cancelling immediately clears the override, the
+# usual case costs a single round trip and there is almost no window in which a
+# dropped connection could leave a clean running to completion -- which would
+# cause the very override being fixed. 3s is confirmed on hardware, 30s is
+# headroom for a device that might need longer. A dwell that does not work is
+# invisible except that the setpoint is overridden again on the next power-off,
+# which is exactly when the next entry is tried.
+FIX_CLEAN_SECONDS = (0.0, 3.0, 30.0)
 
 # DEVICE_LOGS is a paging ring buffer of 6-byte records:
 #   (code: u8, param: u8, ts: int32 LE)  where ts is AGE IN SECONDS at read time.
