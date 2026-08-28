@@ -33,10 +33,17 @@ Supersedes all earlier 1.1.0 betas. Use this one.
 - Override delay 40.1s, against 26.0s in trial 1 — both inside the documented
   3–60s range.
 
+- **The escalation and give-up path, by fault injection.** With the fix replaced
+  by a no-op so the device stayed armed, four power-offs drove attempts at 0s,
+  3s and 30s in order and then emitted `SETPOINT_OVERRIDE_UNFIXABLE` with
+  `attempts: 3`. The attempt count survives across separate watch tasks, and
+  `restored` tracked the user's setpoint correctly at every step. Those paths
+  are unreachable in ordinary testing now that 0s succeeds first.
+
 ### Still unverified
-- The 10s and 30s attempts, and `SETPOINT_OVERRIDE_UNFIXABLE`. Now unreachable
-  in ordinary testing, since 0s succeeds first; exercising them needs deliberate
-  fault injection.
+- Whether a **30s** clean clears an override. 0s and 3s are both confirmed; 30s
+  has only ever been requested, never observed to work, since the fault
+  injection deliberately did nothing.
 
 ## 1.1.0b6
 
