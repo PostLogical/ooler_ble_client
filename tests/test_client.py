@@ -2320,7 +2320,7 @@ class TestSetpointOverride:
 
     @pytest.mark.asyncio
     async def test_disconnect_cancels_the_watch(self) -> None:
-        device, _client = _make_connected_device(power=False)
+        device, _client = _make_connected_device(power=True)
         device._notification_handler(_make_sender(POWER_CHAR), bytearray(b"\x00"))
         task = device._setpoint_override_watch
         assert task is not None
@@ -2401,3 +2401,20 @@ class TestSetpointOverride:
 
         assert device.state.set_temperature == CLEAN_TEMP_F  # reported faithfully
         assert device._last_user_setpoint == 62  # but not mistaken for intent
+
+    @pytest.mark.asyncio
+    async def test_only_a_real_transition_starts_a_watch(self) -> None:
+        """A notification repeating a state we already hold is not the device
+        being turned off -- it is the device re-announcing itself, or a
+        reconnection after another client had it."""
+        device, _client = _make_connected_device(power=False)
+
+        device._notification_handler(_make_sender(POWER_CHAR), bytearray(b"\x00"))
+        assert device._setpoint_override_watch is None  # already off
+
+        device._notification_handler(_make_sender(POWER_CHAR), bytearray(b"\x01"))
+        assert device._setpoint_override_watch is None  # turning on
+
+        device._notification_handler(_make_sender(POWER_CHAR), bytearray(b"\x00"))
+        assert device._setpoint_override_watch is not None  # on -> off
+        await _finish_override_watch(device)

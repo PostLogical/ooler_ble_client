@@ -1,8 +1,18 @@
 # Changelog
 
-## 1.1.0b5
+## 1.1.0b6
 
 Supersedes all earlier 1.1.0 betas. Use this one.
+
+### Fixed
+- **Only a genuine on-to-off transition starts the override watch.** Any
+  notification reporting power off did, including one repeating a state already
+  held -- the device re-announcing itself, or a reconnection after another
+  client had the device. Those are not the device being turned off, and
+  watching them risks reading a stale cached setpoint as an override and
+  powering the unit on to "fix" it.
+
+## 1.1.0b5
 
 ### Fixed
 - **Removed the `CLEAN_TEMP_F` exclusion added in b4.** It guarded a state that

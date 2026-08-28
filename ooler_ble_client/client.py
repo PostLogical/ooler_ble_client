@@ -376,15 +376,21 @@ class OolerBLEDevice:
             )
             changed = False
             if uuid == POWER_CHAR:
-                power = bool(int.from_bytes(data, "little"))
-                if self._state.power != power:
-                    self._state.power = power
+                was_on = bool(self._state.power)
+                is_on = bool(int.from_bytes(data, "little"))
+                if self._state.power != is_on:
+                    self._state.power = is_on
                     changed = True
                 # OFF ends clean. Similarly, when clean mode ends, the device only sends OFF.
-                if not power and self._state.clean:
+                if not is_on and self._state.clean:
                     self._state.clean = False
                     changed = True
-                if not power and (
+                # Watch only a real on -> off transition. A notification
+                # repeating a state we already hold is not the device being
+                # turned off -- it is the device re-announcing itself, or a
+                # reconnection after another client had it -- and watching
+                # those risks reading a stale cached setpoint as an override.
+                if was_on and not is_on and (
                     self._setpoint_override_watch is None
                     or self._setpoint_override_watch.done()
                 ):
