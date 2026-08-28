@@ -1,10 +1,28 @@
 # Changelog
 
-## 1.1.0b4
+## 1.1.0b5
 
 Supersedes all earlier 1.1.0 betas. Use this one.
 
 ### Fixed
+- **Removed the `CLEAN_TEMP_F` exclusion added in b4.** It guarded a state that
+  cannot occur. A clean can only be started by a connected client: either this
+  one, and `set_clean` sets `state.clean` before the device forces its own
+  temperature a couple of seconds later, or another client, which holds the
+  device's single connection so nothing reaches us. `connect()` polls before
+  subscribing, so the flag is fresh before any notification arrives.
+
+  The exclusion had a real cost in exchange: a person choosing exactly 75F was
+  never recorded as having chosen anything, and in Celsius that is 24C — an
+  ordinary setting. So b4 traded a bug that could not happen for one that could.
+
+## 1.1.0b4
+
+### Fixed
+- Excluded `CLEAN_TEMP_F` from being recorded as a user setpoint, on the belief
+  that a clean started elsewhere could set it while `state.clean` was stale.
+  **Withdrawn in b5** — that state is unreachable, and the exclusion discarded
+  genuine 75F/24C choices.
 - **The fix could clear its own recovery flag without stopping the clean.** Its
   cancel went through `set_clean`, which skips the write when it believes the
   device is off — right for external callers, wrong here, since the clean is
