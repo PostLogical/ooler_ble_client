@@ -70,8 +70,12 @@ _RECONNECT_BACKOFF_SECONDS = 0.5
 _SETTLING_PROBE_OFFSETS = (1.0, 5.0)
 
 
-def _hex(data: bytes) -> str:
-    """Render a GATT response for logging, distinguishing an empty one."""
+def _hex(data: bytes | bytearray) -> str:
+    """Render a GATT response for logging, distinguishing an empty one.
+
+    Widened to match what ``read_gatt_char`` actually returns, as
+    ``decode_sleep_schedule_events`` was for the same reason.
+    """
     return data.hex() or "<empty>"
 
 
