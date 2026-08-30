@@ -14,6 +14,7 @@ from bleak_retry_connector import BleakClientWithServiceCache
 from ooler_ble_client import (
     ConnectionEvent,
     ConnectionEventType,
+    DeviceOffError,
     OolerBLEDevice,
     OolerBLEState,
     OolerConnectionError,
@@ -504,14 +505,24 @@ class TestSetMode:
         client.write_gatt_char.assert_called_with(MODE_CHAR, b"\x00", True)
 
     @pytest.mark.asyncio
-    async def test_set_mode_cached_when_off(self) -> None:
-        """Mode is cached but not written to device when off."""
+    async def test_set_mode_refuses_when_off(self) -> None:
+        """The device drops writes while off, so say so rather than record a
+        value it does not hold."""
         device, client = _make_connected_device(power=False)
-        await device.set_mode("Boost")
-        # No GATT write since device is off
+        device._state.mode = "Regular"
+        with pytest.raises(DeviceOffError):
+            await device.set_mode("Boost")
         client.write_gatt_char.assert_not_called()
-        # But state is updated for resend on power-on
-        assert device.state.mode == "Boost"
+        assert device.state.mode == "Regular"
+
+    @pytest.mark.asyncio
+    async def test_set_mode_rejects_an_invalid_mode_before_checking_power(
+        self,
+    ) -> None:
+        """A bad argument is a caller error whatever the device is doing."""
+        device, _client = _make_connected_device(power=False)
+        with pytest.raises(ValueError):
+            await device.set_mode("Turbo")  # type: ignore[arg-type]
 
     @pytest.mark.asyncio
     async def test_set_mode_connects_if_not_connected(self) -> None:
@@ -566,12 +577,27 @@ class TestSetTemperature:
         assert device.state.set_temperature == 120
 
     @pytest.mark.asyncio
-    async def test_set_temperature_cached_when_off(self) -> None:
-        """Temperature is cached but not written to device when off."""
+    async def test_set_temperature_refuses_when_off(self) -> None:
+        """Neither reported state nor the override fix's restore target may
+        record a value the device never accepted."""
         device, client = _make_connected_device(power=False)
-        await device.set_temperature(65)
+        device._state.set_temperature = 70
+        device._last_user_setpoint = 70
+        with pytest.raises(DeviceOffError):
+            await device.set_temperature(65)
         client.write_gatt_char.assert_not_called()
-        assert device.state.set_temperature == 65
+        assert device.state.set_temperature == 70
+        assert device._last_user_setpoint == 70
+
+    @pytest.mark.asyncio
+    async def test_set_temperature_rejects_out_of_range_before_checking_power(
+        self,
+    ) -> None:
+        """Out of range is a caller error whatever the device is doing, and
+        reporting "device is off" would send them down the wrong path."""
+        device, _client = _make_connected_device(power=False)
+        with pytest.raises(ValueError):
+            await device.set_temperature(50)
 
     @pytest.mark.asyncio
     async def test_set_temperature_connects_if_not_connected(self) -> None:
@@ -650,13 +676,13 @@ class TestSetTemperatureUnit:
         )
 
     @pytest.mark.asyncio
-    async def test_set_unit_skipped_when_off(self) -> None:
-        """Unit write is skipped when device is off (no resend-on-power-on)."""
+    async def test_set_unit_refuses_when_off(self) -> None:
+        """Same rule as the other setters: refuse rather than skip silently."""
         device, client = _make_connected_device(power=False)
         device._state.temperature_unit = "F"
-        await device.set_temperature_unit("C")
+        with pytest.raises(DeviceOffError):
+            await device.set_temperature_unit("C")
         client.write_gatt_char.assert_not_called()
-        # State should NOT be updated since write was skipped
         assert device.state.temperature_unit == "F"
 
     @pytest.mark.asyncio
@@ -2470,3 +2496,16 @@ class TestSetpointOverride:
             await device._watch_for_setpoint_override()
 
         assert device._override_fixes_tried == 1
+
+    @pytest.mark.asyncio
+    async def test_a_failed_restore_still_puts_the_power_back(self) -> None:
+        """Between cancelling the clean and restoring power, the device is on
+        and was not asked to be. An error there must not leave it running."""
+        device, _client = _make_connected_device(power=False)
+
+        with patch.object(
+            device, "set_temperature", AsyncMock(side_effect=DeviceOffError("off"))
+        ), patch("asyncio.sleep", AsyncMock()), suppress(DeviceOffError):
+            await device.fix_setpoint_override(setpoint=62)
+
+        assert device.state.power is False

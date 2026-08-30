@@ -2,6 +2,7 @@ from .client import OolerBLEDevice
 from .models import (
     ConnectionEvent,
     ConnectionEventType,
+    DeviceOffError,
     OolerBLEState,
     OolerConnectionError,
     OolerMode,
@@ -18,6 +19,7 @@ from .sleep_schedule import (
 __all__ = [
     "ConnectionEvent",
     "ConnectionEventType",
+    "DeviceOffError",
     "OolerBLEDevice",
     "OolerBLEState",
     "OolerConnectionError",

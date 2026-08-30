@@ -21,6 +21,7 @@ from bleak_retry_connector import (
 from .models import (
     ConnectionEvent,
     ConnectionEventType,
+    DeviceOffError,
     OolerBLEState,
     OolerConnectionError,
     OolerMode,
@@ -761,11 +762,14 @@ class OolerBLEDevice:
         _LOGGER.debug("Set power to %s.", power)
         self._state.power = power
 
-        # When turning on, re-send mode and temperature to the device.
-        # These may have been changed in HA while the Ooler was off, and the
-        # device won't pick them up unless they're written after power-on.
-        # Write directly to GATT here instead of calling set_mode/set_temperature
-        # to keep this as a single atomic operation.
+        # When turning on, re-send mode and temperature. Setters refuse while
+        # the device is off, so these are the values it already reported —
+        # writing them back is a no-op in the ordinary case. It is kept because
+        # the device is not trusted to have retained them across a power cycle,
+        # which is cheap to guarantee and expensive to be wrong about.
+        # Written directly rather than through the setters, both to keep this
+        # atomic and because they would refuse: state.power is not True until
+        # the device confirms.
         if power and self._state.mode is not None:
             mode_int = MODE_INT_TO_MODE_STATE.index(self._state.mode)
             await self._write_gatt(MODE_CHAR, mode_int.to_bytes(1, "little"))
@@ -780,8 +784,9 @@ class OolerBLEDevice:
     async def set_mode(self, mode: OolerMode) -> None:
         """Set pump mode: 'Silent', 'Regular', or 'Boost'.
 
-        If the device is off, the value is cached in state and will be
-        sent to the device on the next set_power(True) call.
+        Raises :class:`DeviceOffError` if the device is off — it drops writes
+        while powered down. Invalid modes raise :class:`ValueError` first,
+        since that is a caller error whatever the device is doing.
         """
         if mode not in MODE_INT_TO_MODE_STATE:
             raise ValueError(
@@ -792,20 +797,21 @@ class OolerBLEDevice:
         if self._client is None:
             raise RuntimeError("Failed to connect to device")
         mode_int = MODE_INT_TO_MODE_STATE.index(mode)
-        if self._state.power:
-            await self._write_gatt(MODE_CHAR, mode_int.to_bytes(1, "little"))
-        else:
-            _LOGGER.debug(
-                "Device is off; mode cached and will be sent on power-on."
+        if not self._state.power:
+            raise DeviceOffError(
+                f"{self._model_id}: cannot set mode while the device is off"
             )
+        await self._write_gatt(MODE_CHAR, mode_int.to_bytes(1, "little"))
         _LOGGER.debug("Set mode to %s.", mode)
         self._state.mode = mode
 
     async def set_temperature(self, settemp_int: int) -> None:
         """Set target temperature. Value should be in the current display unit.
 
-        If the device is off, the value is cached in state and will be
-        sent to the device on the next set_power(True) call.
+        Raises :class:`DeviceOffError` if the device is off — it drops writes
+        while powered down, so there is nothing this can do but say so.
+        Out-of-range values raise :class:`ValueError` first, since that is a
+        caller error whatever the device is doing.
         """
         if self._client is None:
             await self.connect()
@@ -822,15 +828,17 @@ class OolerBLEDevice:
                 f"Temperature {settemp_int} (={settemp_f}°F) out of range. "
                 f"Valid: {TEMP_LO_F} (LO), 54-116, or {TEMP_HI_F} (HI)"
             )
-        if self._state.power:
-            await self._write_gatt(SETTEMP_CHAR, settemp_f.to_bytes(1, "little"))
-        else:
-            _LOGGER.debug(
-                "Device is off; temperature cached and will be sent on power-on."
+        if not self._state.power:
+            raise DeviceOffError(
+                f"{self._model_id}: cannot set temperature while the device is off"
             )
+        await self._write_gatt(SETTEMP_CHAR, settemp_f.to_bytes(1, "little"))
         _LOGGER.debug(
             "Set temperature to %s (wrote %s°F to device).", settemp_int, settemp_f
         )
+        # Only after a write that landed. Recording an intent we did not send
+        # would put a value in state the device does not hold, and in
+        # _last_user_setpoint a value the device never accepted.
         self._state.set_temperature = settemp_int
         self._last_user_setpoint = settemp_int
 
@@ -895,12 +903,16 @@ class OolerBLEDevice:
             await self._write_gatt(CLEAN_CHAR, b"\x00")
             self._state.clean = False
             self._fix_started_clean = False
-        if setpoint is not None:
-            await self.set_temperature(setpoint)
-        if was_off:
-            await self.set_power(False)
-        # None of this was asked for, and the setters do not fire callbacks.
-        self._fire_callbacks()
+        try:
+            if setpoint is not None:
+                await self.set_temperature(setpoint)
+        finally:
+            # Restore the power state even if the setpoint write fails, or an
+            # error between the two would leave the device running unasked.
+            if was_off:
+                await self.set_power(False)
+            # None of this was asked for, and the setters do not fire callbacks.
+            self._fire_callbacks()
 
     async def _watch_for_setpoint_override(self) -> None:
         """After a power-off, fix the device if it overrides the setpoint.
@@ -974,9 +986,9 @@ class OolerBLEDevice:
     async def set_temperature_unit(self, unit: TemperatureUnit) -> None:
         """Set device display unit: 'C' or 'F'.
 
-        Unlike mode and temperature, there is no resend-on-power-on for this
-        setting, so it is only written when the device is on. If the device
-        is off, a warning is logged and the write is skipped.
+        Raises :class:`DeviceOffError` if the device is off — it drops writes
+        while powered down. Invalid units raise :class:`ValueError` first,
+        since that is a caller error whatever the device is doing.
         """
         if unit not in ("C", "F"):
             raise ValueError(f"Invalid temperature unit '{unit}'. Must be 'C' or 'F'")
@@ -985,10 +997,9 @@ class OolerBLEDevice:
         if self._client is None:
             raise RuntimeError("Failed to connect to device")
         if not self._state.power:
-            _LOGGER.warning(
-                "Device is off; display unit write skipped (device drops writes when off)."
+            raise DeviceOffError(
+                f"{self._model_id}: cannot set display unit while the device is off"
             )
-            return
         unit_byte = (1 if unit == "C" else 0).to_bytes(1, "little")
         await self._write_gatt(DISPLAY_TEMPERATURE_UNIT_CHAR, unit_byte)
         _LOGGER.debug("Set temperature unit to %s.", unit)

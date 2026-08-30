@@ -14,6 +14,19 @@ class OolerConnectionError(BleakError):
     """Raised when all retry attempts are exhausted."""
 
 
+class DeviceOffError(Exception):
+    """Raised when a setting cannot be applied because the device is off.
+
+    The device silently drops writes to every characteristic while powered
+    off, so a setter that cannot write says so rather than pretending. Turn
+    the device on first.
+
+    Deliberately not a :class:`~bleak.exc.BleakError`: nothing went wrong with
+    the transport, and inheriting one would let broad ``except BleakError``
+    handlers swallow it.
+    """
+
+
 @dataclass
 class OolerBLEState:
     power: bool | None = None

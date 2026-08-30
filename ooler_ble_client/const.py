@@ -144,6 +144,16 @@ UNKNOWN_2AAA_CHAR = "00002aaa-0000-1000-8000-00805f9b34fb"  # read/write/notify;
 # Reproduced in both directions on two devices (2026-08-26), triggered from
 # Home Assistant, the vendor's app and this library, so it is device firmware
 # rather than any client's doing.
+#
+# A clean cannot be started without a connected client: the unit has no button
+# or hold that starts one, and it cannot schedule one itself (owner-confirmed).
+# The capture guard in _handle_notification depends on this -- it is why
+# state.clean cannot be stale while we are connected and a clean is running.
+#
+# Known limitation: a temperature set within SETPOINT_OVERRIDE_WATCH_SECONDS of
+# a real power-off looks like the device overriding it, so a fix may run on a
+# healthy device. Self-correcting -- the fix writes back the value just set, and
+# the following watch clears the attempt count -- and costs one brief pump run.
 CLEAN_TEMP_F = 75
 
 # How long after a power-off to watch before concluding the device is behaving.

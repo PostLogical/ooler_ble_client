@@ -65,11 +65,11 @@ Main client class.
 - `register_callback(fn)` -- register a state change callback, returns an unsubscribe function
 - `async_poll()` -- read all characteristics from the device
 - `set_power(bool)` -- turn device on/off (re-sends mode and temperature on power-on)
-- `set_mode(OolerMode)` -- set pump mode: `"Silent"`, `"Regular"`, or `"Boost"`
-- `set_temperature(int)` -- set target temperature in the current display unit
+- `set_mode(OolerMode)` -- set pump mode: `"Silent"`, `"Regular"`, or `"Boost"`. Raises `DeviceOffError` if the device is off
+- `set_temperature(int)` -- set target temperature in the current display unit. Raises `DeviceOffError` if the device is off
 - `set_clean(bool)` -- start/stop clean cycle. Starting one powers the device on; stopping one does not, since the device drops writes while off
 - `fix_setpoint_override(setpoint=None, clean_seconds=None)` -- clear the firmware behaviour described in [Setpoint Override After a Deep Clean](#setpoint-override-after-a-deep-clean). `setpoint=None` keeps whatever the device restores by itself
-- `set_temperature_unit(TemperatureUnit)` -- set device display unit: `"C"` or `"F"`
+- `set_temperature_unit(TemperatureUnit)` -- set device display unit: `"C"` or `"F"`. Raises `DeviceOffError` if the device is off
 - `address` -- BLE device address
 - `register_connection_event_callback(fn)` -- register a connectivity event callback, returns an unsubscribe function
 
@@ -107,6 +107,7 @@ Dataclass with fields: `power`, `mode`, `set_temperature`, `actual_temperature`,
 - `OolerMode` -- `Literal["Silent", "Regular", "Boost"]`
 - `TemperatureUnit` -- `Literal["C", "F"]`
 - `OolerConnectionError` -- raised when all retry attempts are exhausted (inherits from `BleakError`)
+- `DeviceOffError` -- raised by `set_temperature`, `set_mode` and `set_temperature_unit` when the device is off. It drops writes while powered down, so these refuse rather than record a value it does not hold. Turn the device on first; `set_clean` is the exception and powers it on, since a clean physically requires it
 
 ## Concurrency & Reconnection
 

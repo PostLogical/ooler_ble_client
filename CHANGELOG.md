@@ -1,5 +1,44 @@
 # Changelog
 
+## 1.1.0b8
+
+**Breaking:** `set_temperature`, `set_mode` and `set_temperature_unit` now raise
+`DeviceOffError` when the device is off, instead of silently caching the value
+or skipping the write.
+
+### Added
+- `DeviceOffError`, exported at the package top level. Not a `BleakError` —
+  nothing went wrong with the transport, and inheriting one would let broad
+  `except BleakError` handlers swallow it.
+
+### Changed
+- **The setters no longer record values the device never accepted.** The device
+  drops writes while powered off. `set_temperature` and `set_mode` skipped the
+  write but still updated cached state, and their docstrings promised the value
+  would be sent on the next power-on — a promise `async_poll` overwrote minutes
+  later with device truth. `set_temperature_unit` skipped and warned.
+
+  One assignment caused four separate symptoms: a setpoint set while off
+  reverted on the next poll; the consistency detector read the deliberate
+  divergence as a missed notification and fired a needless Tier-1 re-subscribe;
+  the override watch read the same field, so setting a temperature during a
+  watch looked like the device overriding and ran a fix on a healthy unit; and
+  consumers showed the new value before it silently reverted.
+
+  All four setters now follow one rule: `set_clean` powers the device on, since
+  a clean physically requires it; the other three refuse. Out-of-range or
+  invalid arguments still raise `ValueError` first — a caller error whatever the
+  device is doing.
+
+  This removes the "set a temperature while off, applied on power-on" behaviour.
+  It never worked for the case it was designed for: staging a setting for later.
+
+### Fixed
+- `fix_setpoint_override` restores the power state in a `finally`. Between
+  cancelling its clean and restoring power the device is on and was not asked to
+  be, so an error in between — now possible, since the setpoint restore can
+  raise — would have left it running.
+
 ## 1.1.0b7
 
 Supersedes all earlier 1.1.0 betas. Use this one.
