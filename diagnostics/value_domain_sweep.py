@@ -1,0 +1,456 @@
+"""Establish what values each Ooler characteristic actually reports.
+
+Before the library can reject a reading as "the device answered before it
+was ready", it has to know what a healthy device emits -- an over-strict
+range would discard real data, which is worse than the bug it fixes. So
+this drives the device across its legal range and records every raw
+response, and the observed values become the floor for any validation.
+
+Phases (2-4 of the protocol; phase 1, draining the reservoir, is manual
+and uses --phase sample alongside):
+
+  setpoints  Write each boundary setpoint and read it back, confirming
+             what the device reports for values it clamps (46-54 -> 45,
+             116-119 -> 120). Also reads MIN_TEMP/MAX_TEMP, which are the
+             device's own published bounds and beat any constant we pick.
+  temps      Sample ACTUALTEMP while the unit runs at LO and at HI, in
+             both display units, to find the real operating envelope. This
+             is the range we have the least evidence for.
+  sample     Read-only sampling on an interval. Use during phase 1, or to
+             watch an untouched device.
+
+Every phase logs POWER, MODE and CLEAN alongside, so the boolean and enum
+domains are confirmed for free.
+
+The device only accepts writes while powered on. If it is off and a write
+phase was asked for, the script refuses unless --power-on is passed. The
+original setpoint, mode, display unit and power state are restored at the
+end, including after Ctrl+C or an error.
+
+Usage:
+    python3 value_domain_sweep.py --phase setpoints --power-on
+    python3 value_domain_sweep.py --phase temps --power-on --soak 30
+    python3 value_domain_sweep.py --phase sample            # read-only
+    python3 value_domain_sweep.py 92106080601 --phase all --power-on
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import sys
+from collections import defaultdict
+from collections.abc import Coroutine
+from datetime import datetime
+from pathlib import Path
+
+from bleak import BleakClient, BleakScanner
+from bleak.backends.device import BLEDevice
+
+from ooler_ble_client.const import (
+    ACTUALTEMP_CHAR,
+    CLEAN_CHAR,
+    DISPLAY_TEMPERATURE_UNIT_CHAR,
+    MAX_TEMP_CHAR,
+    MIN_TEMP_CHAR,
+    MODE_CHAR,
+    MODE_INT_TO_MODE_STATE,
+    POWER_CHAR,
+    SETTEMP_CHAR,
+    TEMP_HI_F,
+    TEMP_LO_F,
+    WATER_LEVEL_CHAR,
+)
+
+# Read on every sample. Order matches the library's own poll.
+SAMPLED: tuple[tuple[str, str], ...] = (
+    ("power", POWER_CHAR),
+    ("mode", MODE_CHAR),
+    ("set_temperature", SETTEMP_CHAR),
+    ("actual_temperature", ACTUALTEMP_CHAR),
+    ("water_level", WATER_LEVEL_CHAR),
+    ("clean", CLEAN_CHAR),
+)
+
+# Boundaries of the documented clamping behaviour, plus a midpoint. The
+# device is expected to snap 46-53 to LO and 116-119 to HI; 54 and 116 are
+# the values the library passes through as LO/HI requests.
+SETPOINT_SWEEP: tuple[int, ...] = (
+    TEMP_LO_F, 46, 53, 54, 55, 75, 115, 116, 119, TEMP_HI_F,
+)
+
+# The ranges proposed for library-side validation. Nothing here constrains
+# the sweep -- they are printed against what was observed so that a range
+# which would have rejected real data is impossible to miss.
+PROPOSED_VALID: dict[str, str] = {
+    "power": "0 or 1",
+    "mode": "0-2",
+    "clean": "0 or 1",
+    "water_level": "1-100",
+    "set_temperature": "45, 54-116, or 120 (raw F)",
+    "actual_temperature": "33-125 F / 1-52 C",
+}
+
+
+def _proposed_rejects(field: str, value: int, unit: str) -> bool:
+    """Would the proposed validation have thrown this reading away?"""
+    if field in ("power", "clean"):
+        return value not in (0, 1)
+    if field == "mode":
+        return not 0 <= value < len(MODE_INT_TO_MODE_STATE)
+    if field == "water_level":
+        return not 1 <= value <= 100
+    if field == "set_temperature":
+        return not (value in (TEMP_LO_F, TEMP_HI_F) or 54 <= value <= 116)
+    if field == "actual_temperature":
+        return not (1 <= value <= 52 if unit == "C" else 33 <= value <= 125)
+    return False
+
+
+async def _read(client: BleakClient, uuid: str) -> dict[str, object]:
+    """Read one characteristic, recording an error rather than raising."""
+    try:
+        data = bytes(await client.read_gatt_char(uuid))
+    except Exception as err:  # noqa: BLE001 - diagnostic script
+        return {"error": f"{type(err).__name__}: {err}"}
+    return {"hex": data.hex(), "len": len(data), "int": int.from_bytes(data, "little")}
+
+
+async def _read_int(client: BleakClient, uuid: str) -> int | None:
+    """Read a characteristic as an int, or None if it failed or was empty."""
+    result = await _read(client, uuid)
+    value = result.get("int")
+    return value if isinstance(value, int) and result.get("len") else None
+
+
+async def find_ooler(target: str | None, timeout: float) -> BLEDevice | None:
+    """Scan for an Ooler by name fragment or address."""
+    seen: dict[str, BLEDevice] = {}
+
+    def on_detect(device: BLEDevice, _adv) -> None:  # noqa: ANN001
+        if "ooler" in (device.name or "").lower():
+            seen[device.address] = device
+
+    scanner = BleakScanner(detection_callback=on_detect)
+    await scanner.start()
+    await asyncio.sleep(timeout)
+    await scanner.stop()
+
+    found = list(seen.values())
+    if not found:
+        return None
+    if target:
+        needle = target.lower()
+        matches = [
+            d for d in found
+            if needle in (d.name or "").lower() or needle in d.address.lower()
+        ]
+        if not matches:
+            names = ", ".join(d.name or d.address for d in found)
+            print(f"No Ooler matching {target!r}. Saw: {names}")
+            return None
+        return matches[0]
+    if len(found) == 1:
+        return found[0]
+    print(f"Found {len(found)} Oolers:")
+    for i, device in enumerate(found, start=1):
+        print(f"  {i}. {device.name} ({device.address})")
+    return found[int((input("Which one? [1]: ").strip() or "1")) - 1]
+
+
+class Sweep:
+    """Drives one device and accumulates every value it reported."""
+
+    def __init__(self, client: BleakClient, device: BLEDevice, out: Path) -> None:
+        self._client = client
+        self._device = device
+        self._fh = out.open("a", encoding="utf-8")
+        self._observed: dict[str, set[int]] = defaultdict(set)
+        self._rejected: list[dict[str, object]] = []
+        self.unit = "F"
+
+    def close(self) -> None:
+        self._fh.close()
+
+    async def sample(self, phase: str, label: str) -> dict[str, object]:
+        """Read every sampled characteristic once and record the result."""
+        record: dict[str, object] = {
+            "timestamp": datetime.now().astimezone().isoformat(),
+            "device": self._device.name,
+            "phase": phase,
+            "label": label,
+            "display_unit": self.unit,
+        }
+        reads: dict[str, object] = {}
+        for field, uuid in SAMPLED:
+            result = await _read(self._client, uuid)
+            reads[field] = result
+            value = result.get("int")
+            if isinstance(value, int) and result.get("len"):
+                self._observed[field].add(value)
+                if _proposed_rejects(field, value, self.unit):
+                    self._rejected.append(
+                        {"field": field, "value": value, "unit": self.unit,
+                         "phase": phase, "label": label}
+                    )
+        record["reads"] = reads
+        self._fh.write(json.dumps(record) + "\n")
+        self._fh.flush()
+        return record
+
+    def describe(self, record: dict[str, object]) -> str:
+        reads = record["reads"]
+        assert isinstance(reads, dict)
+        parts = [f"[{record['label']:>14}]"]
+        for field, _ in SAMPLED:
+            result = reads[field]
+            assert isinstance(result, dict)
+            shown = result.get("hex") if result.get("len") else result.get("error", "<empty>")
+            parts.append(f"{field.split('_')[0]}={shown}")
+        return "  ".join(parts)
+
+    async def soak(self, phase: str, label: str, seconds: float, interval: float) -> None:
+        """Sample on an interval for a while, printing changes only."""
+        deadline = asyncio.get_running_loop().time() + seconds
+        previous: str | None = None
+        while asyncio.get_running_loop().time() < deadline:
+            record = await self.sample(phase, label)
+            line = self.describe(record)
+            if line != previous:
+                print(f"  {datetime.now():%H:%M:%S}  {line}")
+                previous = line
+            await asyncio.sleep(interval)
+
+    async def set_unit(self, unit: str) -> None:
+        """Switch the display unit; ACTUALTEMP reports in whatever it is."""
+        await self._client.write_gatt_char(
+            DISPLAY_TEMPERATURE_UNIT_CHAR,
+            (1 if unit == "C" else 0).to_bytes(1, "little"),
+            response=True,
+        )
+        self.unit = unit
+        await asyncio.sleep(1.0)
+
+    async def set_power(self, on: bool) -> None:
+        await self._client.write_gatt_char(
+            POWER_CHAR, int(on).to_bytes(1, "little"), response=True
+        )
+        await asyncio.sleep(2.0)
+
+    async def set_setpoint(self, temp_f: int) -> None:
+        """Write a setpoint. Always Fahrenheit, whatever the display unit."""
+        await self._client.write_gatt_char(
+            SETTEMP_CHAR, temp_f.to_bytes(1, "little"), response=True
+        )
+
+    async def phase_setpoints(self, settle: float) -> None:
+        """Write each boundary setpoint and read back what the device kept."""
+        print("\n--- Phase 2: setpoint domain ---")
+        for name, uuid in (("MIN_TEMP", MIN_TEMP_CHAR), ("MAX_TEMP", MAX_TEMP_CHAR)):
+            result = await _read(self._client, uuid)
+            print(f"  {name:9} {result}")
+            self._fh.write(
+                json.dumps({"phase": "setpoints", "label": name, "read": result}) + "\n"
+            )
+
+        print(f"  {'written':>9}  {'read back':>9}   raw")
+        for wanted in SETPOINT_SWEEP:
+            await self.set_setpoint(wanted)
+            await asyncio.sleep(settle)
+            record = await self.sample("setpoints", f"wrote {wanted}")
+            reads = record["reads"]
+            assert isinstance(reads, dict)
+            got = reads["set_temperature"]
+            assert isinstance(got, dict)
+            note = "" if got.get("int") == wanted else "  <- clamped"
+            print(f"  {wanted:>9}  {got.get('int'):>9}   {got.get('hex')}{note}")
+
+    async def phase_temps(self, soak_seconds: float, interval: float) -> None:
+        """Sample ACTUALTEMP across the operating envelope, in both units."""
+        print("\n--- Phase 3: actual temperature envelope ---")
+        extremes = [("LO", TEMP_LO_F), ("HI", TEMP_HI_F)]
+        for unit in ("F", "C"):
+            await self.set_unit(unit)
+            print(f"\n  Display unit {unit}")
+            for label, setpoint in extremes:
+                print(f"  Driving to {label} ({setpoint}F) for {soak_seconds / 60:.0f} min")
+                await self.set_setpoint(setpoint)
+                await self.soak("temps", f"{unit}/{label}", soak_seconds, interval)
+            # The display unit changes how the temperature is reported, not
+            # the water. Reversing the order means the second pass starts at
+            # the extreme the first pass ended on, so the unit is not driven
+            # the full span again just to re-read it -- half an hour saved
+            # and one less full heat-cool cycle on the hardware.
+            extremes.reverse()
+
+    def summary(self) -> None:
+        """Print the observed domain per field against what was proposed."""
+        print("\n" + "=" * 72)
+        print("Observed value domains")
+        print("-" * 72)
+        for field, _ in SAMPLED:
+            values = sorted(self._observed.get(field, set()))
+            if not values:
+                print(f"  {field:20} (nothing read)")
+                continue
+            shown = (
+                ", ".join(str(v) for v in values)
+                if len(values) <= 12
+                else f"{len(values)} distinct, {min(values)}..{max(values)}"
+            )
+            print(f"  {field:20} {shown}")
+            print(f"  {'':20} proposed valid: {PROPOSED_VALID[field]}")
+        print("-" * 72)
+        if self._rejected:
+            print(f"  {len(self._rejected)} reading(s) the proposed ranges WOULD HAVE")
+            print("  REJECTED. Every one is a healthy device's real output, so the")
+            print("  range is wrong, not the reading:")
+            for item in self._rejected:
+                print(f"    {item['field']}={item['value']} ({item['unit']}) "
+                      f"during {item['phase']}/{item['label']}")
+        else:
+            print("  No observed reading would have been rejected.")
+        print("=" * 72)
+
+
+async def run(args: argparse.Namespace) -> int:
+    print(f"Scanning for Oolers ({args.scan_timeout}s) ...")
+    device = await find_ooler(args.target, args.scan_timeout)
+    if device is None:
+        print("No Ooler devices found.")
+        return 1
+    print(f"Target: {device.name} ({device.address})")
+
+    writes_needed = args.phase in ("setpoints", "temps", "all")
+    out = args.out or Path(__file__).parent / (
+        f"value_domain_{datetime.now():%Y%m%d_%H%M%S}.jsonl"
+    )
+
+    async with BleakClient(device, timeout=20.0) as client:
+        sweep = Sweep(client, device, out)
+        # Everything that will be put back afterwards.
+        original_power = await _read_int(client, POWER_CHAR)
+        original_setpoint = await _read_int(client, SETTEMP_CHAR)
+        original_mode = await _read_int(client, MODE_CHAR)
+        original_unit = await _read_int(client, DISPLAY_TEMPERATURE_UNIT_CHAR)
+        sweep.unit = "C" if original_unit == 1 else "F"
+        print(
+            f"Baseline: power={original_power} setpoint={original_setpoint}F "
+            f"mode={original_mode} unit={sweep.unit}"
+        )
+
+        if writes_needed and not original_power:
+            if not args.power_on:
+                print(
+                    "\nThe device is off and drops writes while off, so this phase"
+                    "\nwould record nothing. Re-run with --power-on to let the"
+                    "\nscript turn it on; it is turned back off at the end."
+                )
+                sweep.close()
+                return 2
+            print("Device is off; powering on for the sweep (restored at the end).")
+            await sweep.set_power(True)
+
+        try:
+            await sweep.sample("baseline", "start")
+            if args.phase in ("setpoints", "all"):
+                await sweep.phase_setpoints(args.settle)
+            if args.phase in ("temps", "all"):
+                await sweep.phase_temps(args.soak * 60, args.sample_interval)
+            if args.phase == "sample":
+                print(
+                    f"\n--- Sampling every {args.sample_interval}s. Ctrl+C to stop. ---"
+                    "\nFor phase 1, drain the reservoir in steps and note the time of"
+                    "\neach step; changes print as they happen."
+                )
+                await sweep.soak(
+                    "sample", args.label or "sample", args.duration * 60,
+                    args.sample_interval,
+                )
+        except KeyboardInterrupt:
+            print("\nInterrupted.")
+        finally:
+            # Restore only what was written. Sampling is promised read-only
+            # and runs while the operator is mid-drain, so writing the same
+            # values back "harmlessly" would still break that promise.
+            if writes_needed:
+                print("\nRestoring original settings ...")
+
+                async def restore(label: str, action: Coroutine[None, None, None]) -> None:
+                    """Put one setting back, reporting rather than raising.
+
+                    A failure here leaves the device somewhere the operator
+                    did not put it, so it must be said out loud -- but it
+                    must not stop the remaining settings being restored.
+                    """
+                    try:
+                        await action
+                    except Exception as err:  # noqa: BLE001 - diagnostic script
+                        print(f"  WARNING: could not restore {label}: {err}")
+
+                await restore(
+                    "display unit", sweep.set_unit("C" if original_unit == 1 else "F")
+                )
+                if original_setpoint is None:
+                    print("  WARNING: no baseline setpoint to restore")
+                else:
+                    await restore("setpoint", sweep.set_setpoint(original_setpoint))
+                if original_mode is None:
+                    print("  WARNING: no baseline mode to restore")
+                else:
+                    await restore(
+                        "mode",
+                        client.write_gatt_char(
+                            MODE_CHAR,
+                            original_mode.to_bytes(1, "little"),
+                            response=True,
+                        ),
+                    )
+                # Power last: it is what decides whether the device is left
+                # running, and the writes above only land while it is on.
+                await restore("power", sweep.set_power(bool(original_power)))
+            sweep.summary()
+            print(f"Raw samples written to {out}")
+            sweep.close()
+    return 0
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Record the value domain of each Ooler characteristic"
+    )
+    parser.add_argument("target", nargs="?", help="Name fragment or address")
+    parser.add_argument(
+        "--phase", choices=("setpoints", "temps", "sample", "all"), default="all"
+    )
+    parser.add_argument(
+        "--power-on", action="store_true",
+        help="Allow powering the device on for write phases (restored afterwards)",
+    )
+    parser.add_argument(
+        "--settle", type=float, default=3.0,
+        help="Seconds to wait after a setpoint write before reading back (default: 3)",
+    )
+    parser.add_argument(
+        "--soak", type=float, default=30.0,
+        help="Minutes to hold each temperature extreme (default: 30)",
+    )
+    parser.add_argument(
+        "--sample-interval", type=float, default=5.0,
+        help="Seconds between samples (default: 5)",
+    )
+    parser.add_argument(
+        "--duration", type=float, default=600.0,
+        help="Minutes to sample in --phase sample (default: 600)",
+    )
+    parser.add_argument("--label", help="Free-text label recorded on each sample")
+    parser.add_argument("--scan-timeout", type=float, default=10.0)
+    parser.add_argument("--out", type=Path, help="JSONL output path")
+    args = parser.parse_args()
+
+    sys.exit(asyncio.run(run(args)))
+
+
+if __name__ == "__main__":
+    main()
