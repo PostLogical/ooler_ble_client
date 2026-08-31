@@ -153,3 +153,6 @@ snapshots/
 
 # Local working files (prompts, notes, etc.)
 local/
+
+# Raw diagnostic run data: local evidence, not library content.
+diagnostics/*.jsonl
