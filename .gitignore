@@ -156,3 +156,4 @@ local/
 
 # Raw diagnostic run data: local evidence, not library content.
 diagnostics/*.jsonl
+diagnostics/water_level_race.py
