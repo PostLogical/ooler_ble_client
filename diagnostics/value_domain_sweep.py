@@ -244,7 +244,43 @@ class Sweep:
             SETTEMP_CHAR, temp_f.to_bytes(1, "little"), response=True
         )
 
-    async def phase_setpoints(self, settle: float) -> None:
+    async def verify_restore(
+        self,
+        power: int | None,
+        setpoint: int | None,
+        mode: int | None,
+        unit: int | None,
+    ) -> bool:
+        """Read the settings back and confirm they match the baseline.
+
+        Restoring is a write like any other, and the device drops writes
+        while off -- so a restore can fail silently and leave the unit
+        somewhere the operator did not put it. Checking costs four reads.
+        """
+        print("\nVerifying the restore ...")
+        checks = (
+            ("power", power, await _read_int(self._client, POWER_CHAR)),
+            ("setpoint", setpoint, await _read_int(self._client, SETTEMP_CHAR)),
+            ("mode", mode, await _read_int(self._client, MODE_CHAR)),
+            ("display unit", unit,
+             await _read_int(self._client, DISPLAY_TEMPERATURE_UNIT_CHAR)),
+        )
+        ok = True
+        for label, expected, actual in checks:
+            if expected is None:
+                continue
+            if expected == actual:
+                print(f"  {label:13} {actual}  ok")
+            else:
+                ok = False
+                print(f"  {label:13} {actual}  MISMATCH, expected {expected}")
+        if not ok:
+            print("\n  The device was NOT left as it was found. Put it back by hand.")
+        return ok
+
+    async def phase_setpoints(
+        self, settle: float, values: tuple[int, ...]
+    ) -> None:
         """Write each boundary setpoint and read back what the device kept."""
         print("\n--- Phase 2: setpoint domain ---")
         for name, uuid in (("MIN_TEMP", MIN_TEMP_CHAR), ("MAX_TEMP", MAX_TEMP_CHAR)):
@@ -255,7 +291,8 @@ class Sweep:
             )
 
         print(f"  {'written':>9}  {'read back':>9}   raw")
-        for wanted in SETPOINT_SWEEP:
+        readbacks: set[int | None] = set()
+        for wanted in values:
             await self.set_setpoint(wanted)
             await asyncio.sleep(settle)
             record = await self.sample("setpoints", f"wrote {wanted}")
@@ -263,8 +300,19 @@ class Sweep:
             assert isinstance(reads, dict)
             got = reads["set_temperature"]
             assert isinstance(got, dict)
-            note = "" if got.get("int") == wanted else "  <- clamped"
-            print(f"  {wanted:>9}  {got.get('int'):>9}   {got.get('hex')}{note}")
+            value = got.get("int")
+            readbacks.add(value if isinstance(value, int) else None)
+            note = "" if value == wanted else "  <- clamped"
+            print(f"  {wanted:>9}  {value:>9}   {got.get('hex')}{note}")
+
+        if len(readbacks) == 1:
+            # Every write read back the same value, so none of them landed.
+            # The sweep recorded a domain of one, which is not the device's.
+            print(
+                "\n  WARNING: the setpoint never changed across the whole sweep."
+                "\n  The device is dropping writes -- check that it is powered on."
+                "\n  This phase's data is not usable."
+            )
 
     async def phase_temps(self, soak_seconds: float, interval: float) -> None:
         """Sample ACTUALTEMP across the operating envelope, in both units."""
@@ -355,7 +403,10 @@ async def run(args: argparse.Namespace) -> int:
         try:
             await sweep.sample("baseline", "start")
             if args.phase in ("setpoints", "all"):
-                await sweep.phase_setpoints(args.settle)
+                await sweep.phase_setpoints(
+                    args.settle,
+                    (TEMP_LO_F, 75, TEMP_HI_F) if args.smoke else SETPOINT_SWEEP,
+                )
             if args.phase in ("temps", "all"):
                 await sweep.phase_temps(args.soak * 60, args.sample_interval)
             if args.phase == "sample":
@@ -410,6 +461,18 @@ async def run(args: argparse.Namespace) -> int:
                 # Power last: it is what decides whether the device is left
                 # running, and the writes above only land while it is on.
                 await restore("power", sweep.set_power(bool(original_power)))
+                restored = await sweep.verify_restore(
+                    original_power, original_setpoint, original_mode, original_unit
+                )
+                if args.smoke:
+                    print(
+                        "\nSmoke test: the full path ran end to end."
+                        f"\n  restore verified: {'yes' if restored else 'NO'}"
+                        "\n  Check above that reads returned bytes, that the"
+                        "\n  setpoint readback changed as it was written, and that"
+                        "\n  the summary lists a domain per field. If all three"
+                        "\n  hold, the long run will collect what it needs."
+                    )
             sweep.summary()
             print(f"Raw samples written to {out}")
             sweep.close()
@@ -444,10 +507,21 @@ def main() -> None:
         "--duration", type=float, default=600.0,
         help="Minutes to sample in --phase sample (default: 600)",
     )
+    parser.add_argument(
+        "--smoke", action="store_true",
+        help="Exercise the whole path in ~2 minutes: three setpoints, 30s soaks. "
+             "Confirms the run collects what it needs, and that the restore at "
+             "the end works, before committing two hours to it.",
+    )
     parser.add_argument("--label", help="Free-text label recorded on each sample")
     parser.add_argument("--scan-timeout", type=float, default=10.0)
     parser.add_argument("--out", type=Path, help="JSONL output path")
     args = parser.parse_args()
+    if args.smoke:
+        # Same code path as the real run, small enough to sit through.
+        args.soak = min(args.soak, 0.5)
+        args.settle = min(args.settle, 1.5)
+        args.sample_interval = min(args.sample_interval, 3.0)
 
     sys.exit(asyncio.run(run(args)))
 
