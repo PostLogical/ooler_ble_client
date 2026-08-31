@@ -430,8 +430,11 @@ async def run(args: argparse.Namespace) -> int:
     print(f"Target: {device.name} ({device.address})")
 
     writes_needed = args.phase in ("setpoints", "temps", "all")
+    # Named per device: both units can be swept concurrently, and a
+    # timestamp alone collides when two processes start in the same second.
+    slug = (device.name or device.address).replace(":", "").lower()
     out = args.out or Path(__file__).parent / (
-        f"value_domain_{datetime.now():%Y%m%d_%H%M%S}.jsonl"
+        f"value_domain_{slug}_{datetime.now():%Y%m%d_%H%M%S}.jsonl"
     )
 
     async with BleakClient(device, timeout=20.0) as client:
