@@ -19,8 +19,10 @@ and uses --phase sample alongside):
   sample     Read-only sampling on an interval. Use during phase 1, or to
              watch an untouched device.
 
-Every phase logs POWER, MODE and CLEAN alongside, so the boolean and enum
-domains are confirmed for free.
+Phase 2b sweeps the mode enum. CLEAN is never written: starting a clean
+changes the setpoint and, run to completion, arms the setpoint-override
+behaviour the library works around, so its 0/1 domain is left to the
+deep-clean logs. POWER is seen in both states across the run.
 
 The device only accepts writes while powered on. If it is off and a write
 phase was asked for, the script refuses unless --power-on is passed. The
@@ -169,6 +171,9 @@ class Sweep:
         self._observed: dict[str, set[int]] = defaultdict(set)
         self._rejected: list[dict[str, object]] = []
         self.unit = "F"
+        # The device's own published setpoint bounds, read in phase 2.
+        self.min_temp: int | None = None
+        self.max_temp: int | None = None
 
     def close(self) -> None:
         self._fh.close()
@@ -188,7 +193,15 @@ class Sweep:
             reads[field] = result
             value = result.get("int")
             if isinstance(value, int) and result.get("len"):
-                self._observed[field].add(value)
+                # ACTUALTEMP reports in the display unit, so pooling both
+                # would produce a domain spanning two scales and describing
+                # neither -- 20C and 67F are the same reading.
+                key = (
+                    f"{field} ({self.unit})"
+                    if field == "actual_temperature"
+                    else field
+                )
+                self._observed[key].add(value)
                 if _proposed_rejects(field, value, self.unit):
                     self._rejected.append(
                         {"field": field, "value": value, "unit": self.unit,
@@ -283,11 +296,22 @@ class Sweep:
     ) -> None:
         """Write each boundary setpoint and read back what the device kept."""
         print("\n--- Phase 2: setpoint domain ---")
+        print("  Bounds the device publishes about itself:")
         for name, uuid in (("MIN_TEMP", MIN_TEMP_CHAR), ("MAX_TEMP", MAX_TEMP_CHAR)):
             result = await _read(self._client, uuid)
-            print(f"  {name:9} {result}")
+            value = result.get("int") if result.get("len") else None
+            if isinstance(value, int):
+                setattr(self, name.lower(), value)
+                print(f"    {name:9} {value:>4} F   (raw {result.get('hex')})")
+            else:
+                print(f"    {name:9}  --      {result}")
             self._fh.write(
                 json.dumps({"phase": "setpoints", "label": name, "read": result}) + "\n"
+            )
+        if self.min_temp is not None and self.max_temp is not None:
+            print(
+                f"    LO sentinel {TEMP_LO_F} F sits below MIN_TEMP; "
+                f"HI sentinel {TEMP_HI_F} F vs MAX_TEMP {self.max_temp} F"
             )
 
         print(f"  {'written':>9}  {'read back':>9}   raw")
@@ -314,6 +338,32 @@ class Sweep:
                 "\n  This phase's data is not usable."
             )
 
+    async def phase_modes(self, settle: float) -> None:
+        """Write each mode and read it back.
+
+        The protocol assumed the enum domain would be confirmed free of
+        charge by whatever else was running, but nothing else changes the
+        mode -- a sweep that never leaves Regular proves only that Regular
+        exists. CLEAN is deliberately not exercised here: starting a clean
+        changes the setpoint and, run to completion, arms the very
+        setpoint-override behaviour the library works around.
+        """
+        print("\n--- Phase 2b: mode domain ---")
+        print(f"  {'written':>9}  {'read back':>9}   name")
+        for mode_int, name in enumerate(MODE_INT_TO_MODE_STATE):
+            await self._client.write_gatt_char(
+                MODE_CHAR, mode_int.to_bytes(1, "little"), response=True
+            )
+            await asyncio.sleep(settle)
+            record = await self.sample("modes", f"wrote {name}")
+            reads = record["reads"]
+            assert isinstance(reads, dict)
+            got = reads["mode"]
+            assert isinstance(got, dict)
+            value = got.get("int")
+            note = "" if value == mode_int else "  <- not accepted"
+            print(f"  {mode_int:>9}  {value:>9}   {name}{note}")
+
     async def phase_temps(self, soak_seconds: float, interval: float) -> None:
         """Sample ACTUALTEMP across the operating envelope, in both units."""
         print("\n--- Phase 3: actual temperature envelope ---")
@@ -322,7 +372,7 @@ class Sweep:
             await self.set_unit(unit)
             print(f"\n  Display unit {unit}")
             for label, setpoint in extremes:
-                print(f"  Driving to {label} ({setpoint}F) for {soak_seconds / 60:.0f} min")
+                print(f"  Driving to {label} ({setpoint}F) for {soak_seconds / 60:.1f} min")
                 await self.set_setpoint(setpoint)
                 await self.soak("temps", f"{unit}/{label}", soak_seconds, interval)
             # The display unit changes how the temperature is reported, not
@@ -337,18 +387,27 @@ class Sweep:
         print("\n" + "=" * 72)
         print("Observed value domains")
         print("-" * 72)
-        for field, _ in SAMPLED:
-            values = sorted(self._observed.get(field, set()))
+        keys = [f for f, _ in SAMPLED if f != "actual_temperature"]
+        keys += sorted(k for k in self._observed if k.startswith("actual_temperature"))
+        for key in keys:
+            field = key.split(" (")[0]
+            values = sorted(self._observed.get(key, set()))
             if not values:
-                print(f"  {field:20} (nothing read)")
+                print(f"  {key:22} (nothing read)")
                 continue
             shown = (
                 ", ".join(str(v) for v in values)
                 if len(values) <= 12
                 else f"{len(values)} distinct, {min(values)}..{max(values)}"
             )
-            print(f"  {field:20} {shown}")
-            print(f"  {'':20} proposed valid: {PROPOSED_VALID[field]}")
+            print(f"  {key:22} {shown}")
+            print(f"  {'':22} proposed valid: {PROPOSED_VALID[field]}")
+        if self.min_temp is not None and self.max_temp is not None:
+            print(f"  device-published setpoint bounds: "
+                  f"{self.min_temp}-{self.max_temp} F (what it ACCEPTS)")
+            print("  Not a validation range: the device clamps what it accepts")
+            print("  onto a smaller set of values it reports back, so only the")
+            print("  written/read-back pairs above say what a poll can return.")
         print("-" * 72)
         if self._rejected:
             print(f"  {len(self._rejected)} reading(s) the proposed ranges WOULD HAVE")
@@ -407,6 +466,7 @@ async def run(args: argparse.Namespace) -> int:
                     args.settle,
                     (TEMP_LO_F, 75, TEMP_HI_F) if args.smoke else SETPOINT_SWEEP,
                 )
+                await sweep.phase_modes(args.settle)
             if args.phase in ("temps", "all"):
                 await sweep.phase_temps(args.soak * 60, args.sample_interval)
             if args.phase == "sample":
