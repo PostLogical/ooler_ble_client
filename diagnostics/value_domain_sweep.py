@@ -53,12 +53,15 @@ import asyncio
 import io
 import json
 import sys
+import time
 from collections import defaultdict
 from collections.abc import Coroutine
+from typing import Any
 from datetime import datetime
 from pathlib import Path
 
 from bleak import BleakClient, BleakScanner
+from bleak.exc import BleakError
 from bleak.backends.device import BLEDevice
 
 from ooler_ble_client.const import (
@@ -121,20 +124,15 @@ def _proposed_rejects(field: str, value: int, unit: str) -> bool:
     return False
 
 
-async def _read(client: BleakClient, uuid: str) -> dict[str, object]:
-    """Read one characteristic, recording an error rather than raising."""
-    try:
-        data = bytes(await client.read_gatt_char(uuid))
-    except Exception as err:  # noqa: BLE001 - diagnostic script
-        return {"error": f"{type(err).__name__}: {err}"}
-    return {"hex": data.hex(), "len": len(data), "int": int.from_bytes(data, "little")}
-
-
-async def _read_int(client: BleakClient, uuid: str) -> int | None:
-    """Read a characteristic as an int, or None if it failed or was empty."""
-    result = await _read(client, uuid)
-    value = result.get("int")
-    return value if isinstance(value, int) and result.get("len") else None
+# A dropped link used to end a run: every later read recorded an error, the
+# restore could not land, and the unit was left at whichever extreme it had
+# reached. Observed on a 90-minute soak that lost its link at 37 minutes
+# with the host stationary, so range is not the only way this happens.
+_RECONNECT_ATTEMPTS = 12
+_RECONNECT_BACKOFF_SECONDS = 15.0
+# BLEDevice handles can go stale; re-scan periodically rather than retrying
+# a handle that will never work again.
+_RESCAN_EVERY = 3
 
 
 async def find_ooler(target: str | None, timeout: float) -> BLEDevice | None:
@@ -175,9 +173,9 @@ async def find_ooler(target: str | None, timeout: float) -> BLEDevice | None:
 class Sweep:
     """Drives one device and accumulates every value it reported."""
 
-    def __init__(self, client: BleakClient, device: BLEDevice, out: Path) -> None:
-        self._client = client
+    def __init__(self, device: BLEDevice, out: Path) -> None:
         self._device = device
+        self._client: BleakClient | None = None
         self._fh = out.open("a", encoding="utf-8")
         self._observed: dict[str, set[int]] = defaultdict(set)
         self._rejected: list[dict[str, object]] = []
@@ -185,9 +183,98 @@ class Sweep:
         # The device's own published setpoint bounds, read in phase 2.
         self.min_temp: int | None = None
         self.max_temp: int | None = None
+        # Link losses survived, and how long they cost. Reported in the
+        # summary: a run with gaps is weaker evidence than one without, and
+        # a gap that swallowed the end of a soak can make a still-moving
+        # temperature look settled.
+        self.reconnects = 0
+        self.gap_seconds = 0.0
 
     def close(self) -> None:
         self._fh.close()
+
+    async def connect(self) -> None:
+        """Open the link, or raise if it cannot be opened at all."""
+        client = BleakClient(self._device, timeout=20.0)
+        await client.connect()
+        self._client = client
+
+    async def disconnect(self) -> None:
+        client, self._client = self._client, None
+        if client is not None:
+            try:
+                await client.disconnect()
+            except Exception:  # noqa: BLE001 - diagnostic script
+                pass
+
+    async def ensure_connected(self, why: str) -> bool:
+        """Reconnect if the link is gone. False if it stayed gone.
+
+        Re-scans every few attempts: a BLEDevice handle can go stale, and
+        retrying a dead handle forever gets nowhere.
+        """
+        client = self._client
+        if client is not None and client.is_connected:
+            return True
+        started = time.monotonic()
+        for attempt in range(1, _RECONNECT_ATTEMPTS + 1):
+            await self.disconnect()
+            if attempt % _RESCAN_EVERY == 0:
+                found = await find_ooler(self._device.address, 8.0)
+                if found is not None:
+                    self._device = found
+            try:
+                await self.connect()
+            except Exception as err:  # noqa: BLE001 - diagnostic script
+                print(f"  reconnect {attempt}/{_RECONNECT_ATTEMPTS} failed"
+                      f" ({why}): {type(err).__name__}: {err}")
+                await asyncio.sleep(_RECONNECT_BACKOFF_SECONDS)
+                continue
+            gap = time.monotonic() - started
+            self.reconnects += 1
+            self.gap_seconds += gap
+            print(f"  reconnected after {gap:.0f}s ({why})")
+            return True
+        print(f"  giving up reconnecting ({why})")
+        return False
+
+    async def read(self, uuid: str) -> dict[str, object]:
+        """Read a characteristic, reconnecting once before giving up."""
+        for attempt in (1, 2):
+            client = self._client
+            try:
+                if client is None or not client.is_connected:
+                    raise BleakError("not connected")
+                data = bytes(await client.read_gatt_char(uuid))
+                return {"hex": data.hex(), "len": len(data),
+                        "int": int.from_bytes(data, "little")}
+            except Exception as err:  # noqa: BLE001 - diagnostic script
+                if attempt == 2 or not await self.ensure_connected(f"read {uuid[:8]}"):
+                    return {"error": f"{type(err).__name__}: {err}"}
+        return {"error": "unreachable"}
+
+    async def read_int(self, uuid: str) -> int | None:
+        """Read a characteristic as an int, or None if it failed or was empty."""
+        result = await self.read(uuid)
+        value = result.get("int")
+        return value if isinstance(value, int) and result.get("len") else None
+
+    async def write(self, uuid: str, value: int) -> bool:
+        """Write a byte, reconnecting once before giving up."""
+        for attempt in (1, 2):
+            client = self._client
+            try:
+                if client is None or not client.is_connected:
+                    raise BleakError("not connected")
+                await client.write_gatt_char(
+                    uuid, value.to_bytes(1, "little"), response=True
+                )
+                return True
+            except Exception as err:  # noqa: BLE001 - diagnostic script
+                if attempt == 2 or not await self.ensure_connected("write"):
+                    print(f"  write to {uuid[:8]} failed: {type(err).__name__}: {err}")
+                    return False
+        return False
 
     async def sample(self, phase: str, label: str) -> dict[str, object]:
         """Read every sampled characteristic once and record the result."""
@@ -200,7 +287,7 @@ class Sweep:
         }
         reads: dict[str, object] = {}
         for field, uuid in SAMPLED:
-            result = await _read(self._client, uuid)
+            result = await self.read(uuid)
             reads[field] = result
             value = result.get("int")
             if isinstance(value, int) and result.get("len"):
@@ -248,25 +335,17 @@ class Sweep:
 
     async def set_unit(self, unit: str) -> None:
         """Switch the display unit; ACTUALTEMP reports in whatever it is."""
-        await self._client.write_gatt_char(
-            DISPLAY_TEMPERATURE_UNIT_CHAR,
-            (1 if unit == "C" else 0).to_bytes(1, "little"),
-            response=True,
-        )
+        await self.write(DISPLAY_TEMPERATURE_UNIT_CHAR, 1 if unit == "C" else 0)
         self.unit = unit
         await asyncio.sleep(1.0)
 
     async def set_power(self, on: bool) -> None:
-        await self._client.write_gatt_char(
-            POWER_CHAR, int(on).to_bytes(1, "little"), response=True
-        )
+        await self.write(POWER_CHAR, int(on))
         await asyncio.sleep(2.0)
 
     async def set_setpoint(self, temp_f: int) -> None:
         """Write a setpoint. Always Fahrenheit, whatever the display unit."""
-        await self._client.write_gatt_char(
-            SETTEMP_CHAR, temp_f.to_bytes(1, "little"), response=True
-        )
+        await self.write(SETTEMP_CHAR, temp_f)
 
     async def verify_restore(
         self,
@@ -283,11 +362,10 @@ class Sweep:
         """
         print("\nVerifying the restore ...")
         checks = (
-            ("power", power, await _read_int(self._client, POWER_CHAR)),
-            ("setpoint", setpoint, await _read_int(self._client, SETTEMP_CHAR)),
-            ("mode", mode, await _read_int(self._client, MODE_CHAR)),
-            ("display unit", unit,
-             await _read_int(self._client, DISPLAY_TEMPERATURE_UNIT_CHAR)),
+            ("power", power, await self.read_int(POWER_CHAR)),
+            ("setpoint", setpoint, await self.read_int(SETTEMP_CHAR)),
+            ("mode", mode, await self.read_int(MODE_CHAR)),
+            ("display unit", unit, await self.read_int(DISPLAY_TEMPERATURE_UNIT_CHAR)),
         )
         ok = True
         for label, expected, actual in checks:
@@ -309,7 +387,7 @@ class Sweep:
         print("\n--- Phase 2: setpoint domain ---")
         print("  Bounds the device publishes about itself:")
         for name, uuid in (("MIN_TEMP", MIN_TEMP_CHAR), ("MAX_TEMP", MAX_TEMP_CHAR)):
-            result = await _read(self._client, uuid)
+            result = await self.read(uuid)
             value = result.get("int") if result.get("len") else None
             if isinstance(value, int):
                 setattr(self, name.lower(), value)
@@ -362,9 +440,7 @@ class Sweep:
         print("\n--- Phase 2b: mode domain ---")
         print(f"  {'written':>9}  {'read back':>9}   name")
         for mode_int, name in enumerate(MODE_INT_TO_MODE_STATE):
-            await self._client.write_gatt_char(
-                MODE_CHAR, mode_int.to_bytes(1, "little"), response=True
-            )
+            await self.write(MODE_CHAR, mode_int)
             await asyncio.sleep(settle)
             record = await self.sample("modes", f"wrote {name}")
             reads = record["reads"]
@@ -374,6 +450,24 @@ class Sweep:
             value = got.get("int")
             note = "" if value == mode_int else "  <- not accepted"
             print(f"  {mode_int:>9}  {value:>9}   {name}{note}")
+
+    async def phase_hold(
+        self, extreme: str, soak_seconds: float, interval: float
+    ) -> None:
+        """Hold one extreme in Fahrenheit until the temperature stops moving.
+
+        The paired soaks in --phase temps are 30 minutes each and none of
+        them plateaued: HI was still climbing 8F in its final third. An
+        envelope taken from a reading that was still moving understates
+        the range, and a validation bound drawn from it would sit inside
+        what the device really reaches. So hold one end, long.
+        """
+        setpoint = TEMP_HI_F if extreme == "HI" else TEMP_LO_F
+        print(f"\n--- Holding {extreme} ({setpoint}F) for "
+              f"{soak_seconds / 60:.0f} min ---")
+        await self.set_unit("F")
+        await self.set_setpoint(setpoint)
+        await self.soak("hold", f"F/{extreme}", soak_seconds, interval)
 
     async def phase_temps(self, soak_seconds: float, interval: float) -> None:
         """Sample ACTUALTEMP across the operating envelope, in both units."""
@@ -419,6 +513,11 @@ class Sweep:
             print("  Not a validation range: the device clamps what it accepts")
             print("  onto a smaller set of values it reports back, so only the")
             print("  written/read-back pairs above say what a poll can return.")
+        if self.reconnects or self.gap_seconds:
+            print(f"  link losses survived: {self.reconnects}, "
+                  f"{self.gap_seconds:.0f}s total offline")
+            print("  Samples are missing for those gaps. A soak that lost its")
+            print("  link near the end can look settled when it was still moving.")
         print("-" * 72)
         if self._rejected:
             print(f"  {len(self._rejected)} reading(s) the proposed ranges WOULD HAVE")
@@ -440,7 +539,7 @@ async def run(args: argparse.Namespace) -> int:
         return 1
     print(f"Target: {device.name} ({device.address})")
 
-    writes_needed = args.phase in ("setpoints", "temps", "all")
+    writes_needed = args.phase in ("setpoints", "temps", "hold", "all")
     # Named per device: both units can be swept concurrently, and a
     # timestamp alone collides when two processes start in the same second.
     slug = (device.name or device.address).replace(":", "").lower()
@@ -448,13 +547,14 @@ async def run(args: argparse.Namespace) -> int:
         f"value_domain_{slug}_{datetime.now():%Y%m%d_%H%M%S}.jsonl"
     )
 
-    async with BleakClient(device, timeout=20.0) as client:
-        sweep = Sweep(client, device, out)
+    sweep = Sweep(device, out)
+    await sweep.connect()
+    try:
         # Everything that will be put back afterwards.
-        original_power = await _read_int(client, POWER_CHAR)
-        original_setpoint = await _read_int(client, SETTEMP_CHAR)
-        original_mode = await _read_int(client, MODE_CHAR)
-        original_unit = await _read_int(client, DISPLAY_TEMPERATURE_UNIT_CHAR)
+        original_power = await sweep.read_int(POWER_CHAR)
+        original_setpoint = await sweep.read_int(SETTEMP_CHAR)
+        original_mode = await sweep.read_int(MODE_CHAR)
+        original_unit = await sweep.read_int(DISPLAY_TEMPERATURE_UNIT_CHAR)
         sweep.unit = "C" if original_unit == 1 else "F"
         print(
             f"Baseline: power={original_power} setpoint={original_setpoint}F "
@@ -483,6 +583,10 @@ async def run(args: argparse.Namespace) -> int:
                 await sweep.phase_modes(args.settle)
             if args.phase in ("temps", "all"):
                 await sweep.phase_temps(args.soak * 60, args.sample_interval)
+            if args.phase == "hold":
+                await sweep.phase_hold(
+                    args.hold, args.soak * 60, args.sample_interval
+                )
             if args.phase == "sample":
                 print(
                     f"\n--- Sampling every {args.sample_interval}s. Ctrl+C to stop. ---"
@@ -501,8 +605,13 @@ async def run(args: argparse.Namespace) -> int:
             # values back "harmlessly" would still break that promise.
             if writes_needed:
                 print("\nRestoring original settings ...")
+                if not await sweep.ensure_connected("restore"):
+                    print("  NO LINK -- the device is still powered on at the"
+                          "\n  sweep's setpoint and must be put back by hand.")
 
-                async def restore(label: str, action: Coroutine[None, None, None]) -> None:
+                async def restore(
+                    label: str, action: Coroutine[Any, Any, object]
+                ) -> None:
                     """Put one setting back, reporting rather than raising.
 
                     A failure here leaves the device somewhere the operator
@@ -524,14 +633,7 @@ async def run(args: argparse.Namespace) -> int:
                 if original_mode is None:
                     print("  WARNING: no baseline mode to restore")
                 else:
-                    await restore(
-                        "mode",
-                        client.write_gatt_char(
-                            MODE_CHAR,
-                            original_mode.to_bytes(1, "little"),
-                            response=True,
-                        ),
-                    )
+                    await restore("mode", sweep.write(MODE_CHAR, original_mode))
                 # Power last: it is what decides whether the device is left
                 # running, and the writes above only land while it is on.
                 await restore("power", sweep.set_power(bool(original_power)))
@@ -550,6 +652,8 @@ async def run(args: argparse.Namespace) -> int:
             sweep.summary()
             print(f"Raw samples written to {out}")
             sweep.close()
+    finally:
+        await sweep.disconnect()
     return 0
 
 
@@ -559,7 +663,12 @@ def main() -> None:
     )
     parser.add_argument("target", nargs="?", help="Name fragment or address")
     parser.add_argument(
-        "--phase", choices=("setpoints", "temps", "sample", "all"), default="all"
+        "--phase", choices=("setpoints", "temps", "sample", "hold", "all"),
+        default="all",
+    )
+    parser.add_argument(
+        "--hold", choices=("LO", "HI"), default="HI",
+        help="Which extreme --phase hold drives to (default: HI)",
     )
     parser.add_argument(
         "--power-on", action="store_true",
