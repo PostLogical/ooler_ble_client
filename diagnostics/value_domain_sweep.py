@@ -9,10 +9,13 @@ response, and the observed values become the floor for any validation.
 Phases (2-4 of the protocol; phase 1, draining the reservoir, is manual
 and uses --phase sample alongside):
 
-  setpoints  Write each boundary setpoint and read it back, confirming
-             what the device reports for values it clamps (46-54 -> 45,
-             116-119 -> 120). Also reads MIN_TEMP/MAX_TEMP, which are the
-             device's own published bounds and beat any constant we pick.
+  setpoints  Write each boundary setpoint and read it back. The device
+             clamps 46-54 onto 45 and 116-119 onto 120, so what a poll can
+             return is a smaller set than what it accepts, and only the
+             read-back values establish it. MIN_TEMP/MAX_TEMP are recorded
+             as context, not as a range: they describe accepted input, and
+             on these units MIN_TEMP (51 and 53) is itself inside the clamp
+             band, so it is never a value a poll returns.
   temps      Sample ACTUALTEMP while the unit runs at LO and at HI, in
              both display units, to find the real operating envelope. This
              is the range we have the least evidence for.
@@ -29,6 +32,13 @@ phase was asked for, the script refuses unless --power-on is passed. The
 original setpoint, mode, display unit and power state are restored at the
 end, including after Ctrl+C or an error.
 
+Settings are restored in a ``finally``, which covers a normal exit and
+Ctrl+C but not the process being killed -- and a killed write phase leaves
+the unit powered on at whichever extreme it had reached. Detach anything
+long so a closing terminal cannot kill it:
+
+    nohup python3 value_domain_sweep.py 601 --phase temps --power-on &
+
 Usage:
     python3 value_domain_sweep.py --phase setpoints --power-on
     python3 value_domain_sweep.py --phase temps --power-on --soak 30
@@ -40,6 +50,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import io
 import json
 import sys
 from collections import defaultdict
@@ -580,6 +591,12 @@ def main() -> None:
     parser.add_argument("--scan-timeout", type=float, default=10.0)
     parser.add_argument("--out", type=Path, help="JSONL output path")
     args = parser.parse_args()
+    # Line-buffer stdout. Redirected to a file it is block-buffered, so a
+    # process killed mid-run loses everything it had printed -- which is
+    # how a killed sweep left no record of how far it got, while its JSONL
+    # survived because that is flushed per sample.
+    if isinstance(sys.stdout, io.TextIOWrapper):
+        sys.stdout.reconfigure(line_buffering=True)
     if args.smoke:
         # Same code path as the real run, small enough to sit through.
         args.soak = min(args.soak, 0.5)
