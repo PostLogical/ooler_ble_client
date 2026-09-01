@@ -163,6 +163,21 @@ UNKNOWN_2AAA_CHAR = "00002aaa-0000-1000-8000-00805f9b34fb"  # read/write/notify;
 # The capture guard in _handle_notification depends on this -- it is why
 # state.clean cannot be stale while we are connected and a clean is running.
 #
+# WHEN THE FIX RUNS: nothing watches for a clean completing. The only trigger
+# is a setpoint change seen while the device stays off -- but a completed clean
+# always produces one, because completion powers the device off and the stored
+# value then replaces the clean's forced CLEAN_TEMP_F. So the fix effectively
+# runs automatically after every deep clean that completes while we are
+# connected, not only later once a user has noticed their temperature resetting.
+# That is deliberate on firmware 15.20, where a completed clean ALWAYS arms the
+# override: fixing at once means the user never sees the symptom at all.
+#
+# IF A FIRMWARE RELEASE EVER FIXES THE OVERRIDE, this after-every-clean
+# behaviour has to go. A setpoint change following a clean would no longer be
+# evidence of anything, and a fix clean after every deep clean would be pure
+# cost -- an unasked-for pump run each time. Gate the watch on the affected
+# firmware version (see _watch_for_setpoint_override), or drop it entirely.
+#
 # Known limitation: a temperature set within SETPOINT_OVERRIDE_WATCH_SECONDS of
 # a real power-off looks like the device overriding it, so a fix may run on a
 # healthy device. Self-correcting -- the fix writes back the value just set, and

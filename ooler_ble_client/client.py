@@ -949,6 +949,13 @@ class OolerBLEDevice:
         setpoint while off, and it accepts one connection at a time so nothing
         else can be writing. Powering back on or losing the link mid-watch
         proves nothing either way, so neither counts as evidence.
+
+        Note that a deep clean completing powers the device off and is then
+        followed by exactly such a change, so this fixes automatically after
+        every completed clean, not only on some later power-off. On firmware
+        15.20 that is correct -- a completed clean always arms the override --
+        but it is the first thing to remove if a firmware release fixes it.
+        See CLEAN_TEMP_F in const.py.
         """
         reported = self._state.set_temperature
         deadline = self._monotonic() + SETPOINT_OVERRIDE_WATCH_SECONDS

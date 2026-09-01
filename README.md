@@ -176,13 +176,17 @@ The client handles it without any work from the consumer:
 2. A setpoint change while the device stays off can only be the device itself — it drops writes while off, its buttons cannot change the setpoint while off, and it accepts one connection at a time.
 3. `fix_setpoint_override()` runs, and `SETPOINT_OVERRIDE_FIXED` is emitted.
 
+**In practice this means the client repairs the device after every deep clean that completes while it is connected** — not only later, once the symptom shows. A completed clean ends by powering the device off, and the stored setpoint then replaces the clean's forced 75, which is exactly the evidence step 2 looks for. Nothing watches for the clean itself; the power-off it causes is enough. On firmware 15.20 that is what you want, since a completed clean always leaves the device in this state, so the user never sees a reset temperature at all.
+
+**If a firmware release ever fixes the override, this must change.** A setpoint change after a clean would no longer be evidence of anything, and a fix clean after every deep clean would just be an unasked-for pump run each time. The watch would need gating on the affected firmware version, or removing.
+
 Cancelling makes the device restore its own stored setpoint. The client overwrites that only if a person actually asked for something — on the first override after a clean, the reported value is the clean's forced 75 while the device's stored value is the pre-clean setpoint, which is the better answer.
 
 Attempts use successively longer clean durations (`FIX_CLEAN_SECONDS`, 0s/3s/30s) rather than repeating one that just failed. Running out emits `SETPOINT_OVERRIDE_UNFIXABLE` and stops, rather than running the pump after every power-off forever.
 
 The override lands 3s to 60s after power-off with no pattern we can find, so any manual check needs minutes, not seconds.
 
-**Known gap:** a clean completing while nothing is connected is not noticed, so the device stays overridden until something connects and the symptom shows on a later power-off. Reachable with nobody present — cleans can be started at the unit's buttons, and connections drop on their own. The consequence is a delayed fix, not a missed one.
+**Known gap:** a clean completing while nothing is connected is not noticed, so the device stays overridden until something connects and the symptom shows on a later power-off. Every clean is started by some client — the vendor's app, Home Assistant, this library — but none of them has to stay connected for it to run to completion, so the power-off that ends it can land with nothing listening. Reachable with nobody present: the app starts a clean and walks away, or our connection drops partway through. The consequence is a delayed fix, not a missed one.
 
 ## License
 
