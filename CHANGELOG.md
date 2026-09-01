@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.1.0b9
+## 1.1.0b10
 
 ### Fixed
 - **A reading the device cannot be making is no longer published.** After a
@@ -20,6 +20,14 @@
   Only these two are guarded. Power, mode, setpoint and clean are stored
   settings, read correctly in every capture taken, and guarding them would
   be defending against something never observed.
+
+## 1.1.0b9
+
+Debug-only diagnostics for the placeholder read above: the raw hex of every
+GATT response on each poll, and a probe re-reading the two sensor-derived
+characteristics 1s and 5s after a connect. They answered their question --
+the device does hold the real value moments later -- and are removed in
+b10, which needs neither, since the cached value was already correct.
 
 ## 1.1.0b8
 
