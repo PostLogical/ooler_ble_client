@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import struct
 import time
 from collections.abc import Callable, Coroutine
@@ -49,6 +48,9 @@ from .const import (
     TEMP_MIN_F,
     TEMP_MAX_F,
     TEMP_HI_F,
+    WATER_LEVEL_RANGE,
+    ACTUAL_TEMP_RANGE_F,
+    ACTUAL_TEMP_RANGE_C,
     _SHUTDOWN_ERROR_BACKOFF_SECONDS,
     _SHUTDOWN_ERROR_MAX_ATTEMPTS,
 )
@@ -63,20 +65,6 @@ from .sleep_schedule import (
 )
 
 _RECONNECT_BACKOFF_SECONDS = 0.5
-
-# DIAGNOSTIC -- see OolerBLEDevice._settling_probe. Two samples rather than
-# one: a single reading that is still a placeholder only rules out that one
-# offset, where a pair bounds the settling time from one occurrence.
-_SETTLING_PROBE_OFFSETS = (1.0, 5.0)
-
-
-def _hex(data: bytes | bytearray) -> str:
-    """Render a GATT response for logging, distinguishing an empty one.
-
-    Widened to match what ``read_gatt_char`` actually returns, as
-    ``decode_sleep_schedule_events`` was for the same reason.
-    """
-    return data.hex() or "<empty>"
 
 
 def _byteswap_uint16s(data: bytes) -> bytes:
@@ -156,8 +144,6 @@ class OolerBLEDevice:
         self._override_fixes_tried: int = 0
         # A clean this client started for a fix and has not yet stopped.
         self._fix_started_clean: bool = False
-        # DIAGNOSTIC -- see _settling_probe.
-        self._settling_probe_task: asyncio.Task[None] | None = None
 
     def set_ble_device(self, ble_device: BLEDevice) -> None:
         """Set the BLE Device."""
@@ -341,10 +327,6 @@ class OolerBLEDevice:
                 await client.disconnect()
                 raise
         self._fire_connection_event(ConnectionEventType.CONNECTED)
-        # DIAGNOSTIC (see _settling_probe): after the event, and detached, so
-        # that neither its sleeps nor its reads sit between a caller and the
-        # connection it asked for.
-        self._settling_probe_task = asyncio.create_task(self._settling_probe(client))
 
     async def _establish_with_shutdown_backoff(
         self, ble_device: BLEDevice
@@ -479,59 +461,6 @@ class OolerBLEDevice:
                 exc_info=True,
             )
 
-    async def _settling_probe(self, client: BleakClientWithServiceCache) -> None:
-        """DIAGNOSTIC -- remove once the placeholder initial read is understood.
-
-        The two sensor-derived characteristics sometimes answer the first
-        read after a connect with a placeholder -- water level 0 on a full
-        tank, temperature 0x81 -- while the stored settings alongside them
-        read correctly. For temperature the truth arrives ~0.4s later by
-        notification, but water level is not subscribed, so its placeholder
-        survives until the next poll.
-
-        Re-read both at each offset in :data:`_SETTLING_PROBE_OFFSETS` and
-        log what comes back. The values are deliberately discarded: this
-        establishes only whether a re-read returns real data and how long
-        it takes, which is what decides between re-reading and rejecting
-        known placeholder values. Never raises -- a diagnostic must not be
-        able to fail a connection.
-
-        Runs as a background task so its sleeps cannot delay a connect,
-        and reads a client handed in rather than ``self._client``, which
-        may be replaced by a reconnect while this is still sleeping.
-        """
-        if not _LOGGER.isEnabledFor(logging.DEBUG):
-            # The sleeps and GATT reads below buy nothing when their only
-            # product, a log line, is going nowhere.
-            return
-        elapsed = 0.0
-        for offset in _SETTLING_PROBE_OFFSETS:
-            try:
-                await asyncio.sleep(offset - elapsed)
-                elapsed = offset
-                water = await client.read_gatt_char(WATER_LEVEL_CHAR)
-                actualtemp = await client.read_gatt_char(ACTUALTEMP_CHAR)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                _LOGGER.debug(
-                    "%s: Settling probe stopped at %ss",
-                    self._model_id,
-                    offset,
-                    exc_info=True,
-                )
-                return
-            _LOGGER.debug(
-                "%s: Settling probe at %ss: water=%s actualtemp=%s"
-                " (state holds water_level=%s actual_temperature=%s)",
-                self._model_id,
-                offset,
-                _hex(water),
-                _hex(actualtemp),
-                self._state.water_level,
-                self._state.actual_temperature,
-            )
-
     async def _read_all_characteristics(self) -> OolerBLEState:
         """Read all GATT characteristics and return a new state."""
         client = self._client
@@ -544,21 +473,6 @@ class OolerBLEDevice:
         actualtemp_byte = await client.read_gatt_char(ACTUALTEMP_CHAR)
         waterlevel_byte = await client.read_gatt_char(WATER_LEVEL_CHAR)
         clean_byte = await client.read_gatt_char(CLEAN_CHAR)
-
-        # DIAGNOSTIC (see _settling_probe): the parsed state alone cannot
-        # distinguish a placeholder the device sent from a response that
-        # carried no data, since both parse to 0.
-        _LOGGER.debug(
-            "%s: Raw reads: power=%s mode=%s settemp=%s actualtemp=%s"
-            " water=%s clean=%s",
-            self._model_id,
-            _hex(power_byte),
-            _hex(mode_byte),
-            _hex(settemp_byte),
-            _hex(actualtemp_byte),
-            _hex(waterlevel_byte),
-            _hex(clean_byte),
-        )
 
         power = bool(int.from_bytes(power_byte, "little"))
         mode_int = int.from_bytes(mode_byte, "little")
@@ -578,14 +492,38 @@ class OolerBLEDevice:
 
         # Use cached temperature_unit (read once on connect)
         temperature_unit = self._state.temperature_unit or "F"
+
+        # The two sensor-derived characteristics sometimes answer a read
+        # taken just after a connect with a placeholder instead of a value.
+        # Keeping the last one is not a compromise: water level changes over
+        # days, and a temperature is replaced by its notification within a
+        # second, so the cached value is the right one either way.
+        actual_low, actual_high = (
+            ACTUAL_TEMP_RANGE_C if temperature_unit == "C" else ACTUAL_TEMP_RANGE_F
+        )
+        actual_temperature: int | None = actualtemp_int
+        if not actual_low <= actualtemp_int <= actual_high:
+            _LOGGER.warning(
+                "%s: Ignoring actual temperature %s, outside %s-%s%s",
+                self._model_id, actualtemp_int, actual_low, actual_high,
+                temperature_unit,
+            )
+            actual_temperature = self._state.actual_temperature
+        water_level: int | None = waterlevel_int
+        if not WATER_LEVEL_RANGE[0] <= waterlevel_int <= WATER_LEVEL_RANGE[1]:
+            _LOGGER.warning(
+                "%s: Ignoring water level %s, outside %s-%s",
+                self._model_id, waterlevel_int, *WATER_LEVEL_RANGE,
+            )
+            water_level = self._state.water_level
         set_temperature = _f_to_c(settemp_f) if temperature_unit == "C" else settemp_f
 
         return OolerBLEState(
             power=power,
             mode=mode,
             set_temperature=set_temperature,
-            actual_temperature=actualtemp_int,
-            water_level=waterlevel_int,
+            actual_temperature=actual_temperature,
+            water_level=water_level,
             clean=clean,
             temperature_unit=temperature_unit,
         )
@@ -1291,10 +1229,6 @@ class OolerBLEDevice:
             # Outlives the connection otherwise, and fixing needs the link.
             self._setpoint_override_watch.cancel()
             self._setpoint_override_watch = None
-        if self._settling_probe_task is not None:
-            # DIAGNOSTIC: would otherwise wake up and read a closed client.
-            self._settling_probe_task.cancel()
-            self._settling_probe_task = None
         async with self._connect_lock:
             client = self._client
             self._expected_disconnect = True

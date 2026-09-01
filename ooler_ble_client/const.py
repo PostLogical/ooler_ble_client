@@ -33,6 +33,19 @@ TEMP_MIN_F = 55
 TEMP_MAX_F = 115
 TEMP_HI_F = 120
 
+# What the two sensor-derived characteristics can report. Anything else is
+# the device answering before it has a value -- water level 0 on a full
+# tank, actual temperature 0x81 -- on roughly 1% of connects, measured with
+# diagnostics/value_domain_sweep.py on both units, firmware 15.20.
+# Water level reads 1 at the real low-water lockout, so 0 is unused; the
+# range is wider than the observed {1, 50, 100} so an in-between level from
+# some other firmware is not discarded. The temperature bound is physical
+# rather than a capability figure -- below freezing there is no liquid
+# water -- and stays wide because how cold a unit runs tracks its ambient.
+WATER_LEVEL_RANGE = (1, 100)
+ACTUAL_TEMP_RANGE_F = (33, 125)
+ACTUAL_TEMP_RANGE_C = (1, 52)
+
 # -- Device info service (0000180a-0000-1000-8000-00805f9b34fb) --
 # Standard BLE Device Information Service.
 MANUFACTURER_NAME_CHAR = "00002a29-0000-1000-8000-00805f9b34fb"  # read; "Kryo, Inc."
