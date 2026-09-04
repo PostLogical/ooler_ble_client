@@ -163,20 +163,15 @@ UNKNOWN_2AAA_CHAR = "00002aaa-0000-1000-8000-00805f9b34fb"  # read/write/notify;
 # The capture guard in _handle_notification depends on this -- it is why
 # state.clean cannot be stale while we are connected and a clean is running.
 #
-# WHEN THE FIX RUNS: nothing watches for a clean completing. The only trigger
-# is a setpoint change seen while the device stays off -- but a completed clean
-# always produces one, because completion powers the device off and the stored
-# value then replaces the clean's forced CLEAN_TEMP_F. So the fix effectively
-# runs automatically after every deep clean that completes while we are
-# connected, not only later once a user has noticed their temperature resetting.
-# That is deliberate on firmware 15.20, where a completed clean ALWAYS arms the
-# override: fixing at once means the user never sees the symptom at all.
-#
-# IF A FIRMWARE RELEASE EVER FIXES THE OVERRIDE, this after-every-clean
-# behaviour has to go. A setpoint change following a clean would no longer be
-# evidence of anything, and a fix clean after every deep clean would be pure
-# cost -- an unasked-for pump run each time. Gate the watch on the affected
-# firmware version (see _watch_for_setpoint_override), or drop it entirely.
+# WHEN THE FIX RUNS: only on an override observed after an ordinary power-off.
+# The power-off that ends a clean is deliberately NOT watched. A clean forces
+# SET_TEMP to CLEAN_TEMP_F and the device reverts that whenever the clean ends,
+# so a revert following a clean is expected behaviour rather than evidence, and
+# it looks the same whether the clean completed (which arms the override) or was
+# aborted by powering the unit off (which does not). Watching it would run a fix
+# clean on devices that were never armed. Nothing is lost by skipping it: an
+# armed device overrides on EVERY power-off, so the next ordinary one catches
+# it. See _handle_notification.
 #
 # Known limitation: a temperature set within SETPOINT_OVERRIDE_WATCH_SECONDS of
 # a real power-off looks like the device overriding it, so a fix may run on a

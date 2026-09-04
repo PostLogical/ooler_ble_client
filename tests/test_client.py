@@ -2526,6 +2526,23 @@ class TestSetpointOverride:
         await _finish_override_watch(device)
 
     @pytest.mark.asyncio
+    async def test_the_power_off_that_ends_a_clean_is_not_watched(self) -> None:
+        """A clean forces the setpoint to CLEAN_TEMP_F and the device reverts it
+        whenever the clean ends, so that revert is expected rather than evidence.
+        It looks the same whether the clean completed -- which arms the override
+        -- or was aborted by powering the unit off, which does not, so watching
+        it would run a fix clean on a device that was never armed."""
+        device, _client = _make_connected_device(power=True)
+        device._last_notified_power = True
+        device._state.clean = True
+        device._state.set_temperature = CLEAN_TEMP_F
+
+        device._notification_handler(_make_sender(POWER_CHAR), bytearray(b"\x00"))
+
+        assert device.state.clean is False
+        assert device._setpoint_override_watch is None
+
+    @pytest.mark.asyncio
     async def test_a_power_off_commanded_through_the_library_is_watched(self) -> None:
         """set_power updates state.power optimistically, so by the time the
         device's own notification arrives the cached value already says off.

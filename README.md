@@ -176,9 +176,7 @@ The client handles it without any work from the consumer:
 2. A setpoint change while the device stays off can only be the device itself — it drops writes while off, its buttons cannot change the setpoint while off, and it accepts one connection at a time.
 3. `fix_setpoint_override()` runs, and `SETPOINT_OVERRIDE_FIXED` is emitted.
 
-**In practice this means the client repairs the device after every deep clean that completes while it is connected** — not only later, once the symptom shows. A completed clean ends by powering the device off, and the stored setpoint then replaces the clean's forced 75, which is exactly the evidence step 2 looks for. Nothing watches for the clean itself; the power-off it causes is enough. On firmware 15.20 that is what you want, since a completed clean always leaves the device in this state, so the user never sees a reset temperature at all.
-
-**If a firmware release ever fixes the override, this must change.** A setpoint change after a clean would no longer be evidence of anything, and a fix clean after every deep clean would just be an unasked-for pump run each time. The watch would need gating on the affected firmware version, or removing.
+**The power-off that ends a clean is excluded from step 1.** A clean forces the setpoint to 75 and the device reverts that whenever the clean ends, so a revert straight after a clean is expected behaviour, not evidence — and it looks identical whether the clean ran to completion (which arms the override) or was aborted by powering the unit off (which does not). Watching it would run a fix clean on devices that were never armed. Nothing is lost: an armed device overrides on *every* power-off, so the next ordinary one catches it.
 
 Cancelling makes the device restore its own stored setpoint. The client overwrites that only if a person actually asked for something — on the first override after a clean, the reported value is the clean's forced 75 while the device's stored value is the pre-clean setpoint, which is the better answer.
 

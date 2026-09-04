@@ -394,7 +394,8 @@ class OolerBLEDevice:
                     self._state.power = is_on
                     changed = True
                 # OFF ends clean. Similarly, when clean mode ends, the device only sends OFF.
-                if not is_on and self._state.clean:
+                ended_a_clean = not is_on and self._state.clean
+                if ended_a_clean:
                     self._state.clean = False
                     changed = True
                 # Watch only a real on -> off transition. A notification
@@ -402,7 +403,16 @@ class OolerBLEDevice:
                 # turned off -- it is the device re-announcing itself, or a
                 # reconnection after another client had it -- and watching
                 # those risks reading a stale cached setpoint as an override.
-                if was_on and not is_on and (
+                #
+                # A power-off that ends a clean is excluded too. A clean forces
+                # the setpoint to CLEAN_TEMP_F and the device reverts that when
+                # the clean ends, so a revert here is expected behaviour rather
+                # than evidence -- and it looks the same whether the clean ran to
+                # completion, which arms the override, or was aborted by powering
+                # the unit off, which does not. Watching it would run a fix clean
+                # on devices that were never armed. An armed device overrides on
+                # every power-off, so the next ordinary one still catches it.
+                if was_on and not is_on and not ended_a_clean and (
                     self._setpoint_override_watch is None
                     or self._setpoint_override_watch.done()
                 ):
@@ -950,12 +960,10 @@ class OolerBLEDevice:
         else can be writing. Powering back on or losing the link mid-watch
         proves nothing either way, so neither counts as evidence.
 
-        Note that a deep clean completing powers the device off and is then
-        followed by exactly such a change, so this fixes automatically after
-        every completed clean, not only on some later power-off. On firmware
-        15.20 that is correct -- a completed clean always arms the override --
-        but it is the first thing to remove if a firmware release fixes it.
-        See CLEAN_TEMP_F in const.py.
+        The power-off that ends a clean never starts one of these, because the
+        device's revert of the setpoint the clean forced is expected there and
+        proves nothing about whether the override was armed. See
+        _handle_notification and CLEAN_TEMP_F in const.py.
         """
         reported = self._state.set_temperature
         deadline = self._monotonic() + SETPOINT_OVERRIDE_WATCH_SECONDS
