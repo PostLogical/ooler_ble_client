@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.1.0b11
+
+### Fixed
+- **The deep-clean fix no longer runs on devices it was never needed for.** A
+  clean forces the setpoint to 75, and the device reverts that whenever the
+  clean ends — so the revert following the clean's own power-off is expected
+  behaviour, not evidence. It looks identical whether the clean ran to
+  completion, which arms the override, or was aborted by powering the unit off,
+  which does not, so the watch was starting fix cleans on unarmed devices.
+
+  That power-off is no longer watched. Nothing is lost: an armed device
+  overrides the setpoint on every power-off, so the next ordinary one catches
+  it. The cost is that a device stays armed until it is next used and switched
+  off, rather than being repaired on the spot.
+
+### Added
+- The raw hex of every GATT response is logged on each poll again, at DEBUG.
+  The rejection guard added in b10 names the value it discarded but not the
+  response it came from, and once parsed, a placeholder the device sent is
+  indistinguishable from a response that carried no data — both are 0. The b9
+  settling probe stays removed.
+
 ## 1.1.0b10
 
 ### Fixed
