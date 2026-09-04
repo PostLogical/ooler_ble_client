@@ -67,6 +67,15 @@ from .sleep_schedule import (
 _RECONNECT_BACKOFF_SECONDS = 0.5
 
 
+def _hex(data: bytes | bytearray) -> str:
+    """Render a GATT response for logging, distinguishing an empty one.
+
+    Accepts bytearray as well as bytes, matching what ``read_gatt_char``
+    actually returns.
+    """
+    return data.hex() or "<empty>"
+
+
 def _byteswap_uint16s(data: bytes) -> bytes:
     """Swap each pair of bytes in a buffer.
 
@@ -483,6 +492,21 @@ class OolerBLEDevice:
         actualtemp_byte = await client.read_gatt_char(ACTUALTEMP_CHAR)
         waterlevel_byte = await client.read_gatt_char(WATER_LEVEL_CHAR)
         clean_byte = await client.read_gatt_char(CLEAN_CHAR)
+
+        # The parsed state alone cannot distinguish a placeholder the device
+        # sent from a response that carried no data, since both parse to 0.
+        # Only the raw responses show which happened, so log them.
+        _LOGGER.debug(
+            "%s: Raw reads: power=%s mode=%s settemp=%s actualtemp=%s"
+            " water=%s clean=%s",
+            self._model_id,
+            _hex(power_byte),
+            _hex(mode_byte),
+            _hex(settemp_byte),
+            _hex(actualtemp_byte),
+            _hex(waterlevel_byte),
+            _hex(clean_byte),
+        )
 
         power = bool(int.from_bytes(power_byte, "little"))
         mode_int = int.from_bytes(mode_byte, "little")
