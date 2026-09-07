@@ -36,6 +36,8 @@ from .const import (
     ACTUALTEMP_CHAR,
     WATER_LEVEL_CHAR,
     CLEAN_CHAR,
+    CLEAN_TEMP_F,
+    UV_CLEAN_MAX_SECONDS,
     FIX_CLEAN_SECONDS,
     SETPOINT_OVERRIDE_WATCH_SECONDS,
     DISPLAY_TEMPERATURE_UNIT_CHAR,
@@ -153,6 +155,19 @@ class OolerBLEDevice:
         self._override_fixes_tried: int = 0
         # A clean this client started for a fix and has not yet stopped.
         self._fix_started_clean: bool = False
+        # When the CLEAN characteristic was first seen asserted in the current
+        # run of assertions, for the UV_CLEAN_MAX_SECONDS backstop. None while
+        # the bit reads clear.
+        self._clean_asserted_since: float | None = None
+        # A deep clean this client asked for, from the write until it stops.
+        # Provenance is deliberately NOT part of what deep_clean means -- a
+        # clean started in the vendor's app has to be recognised too, and that
+        # is what the CLEAN_TEMP_F discriminator is for. This exists only to
+        # win a race the discriminator cannot: the device's forced-setpoint
+        # notification arrives ~2s after our write, and a poll may not have
+        # happened yet, so without this the handler would record the clean's
+        # own temperature as the user's choice.
+        self._deep_clean_pending: bool = False
 
     def set_ble_device(self, ble_device: BLEDevice) -> None:
         """Set the BLE Device."""
@@ -311,13 +326,24 @@ class OolerBLEDevice:
                 _LOGGER.debug("%s: Attempt to retrieve initial state.", self._model_id)
                 await self.async_poll()
                 if self._fix_started_clean:
-                    # A fix lost the link before stopping its clean. Letting it
-                    # finish would cause the override the fix was clearing.
-                    _LOGGER.warning(
-                        "%s: Stopping a clean left running by an interrupted fix.",
-                        self._model_id,
-                    )
-                    await self.set_clean(False)
+                    if self._state.power:
+                        # A fix lost the link before stopping its clean. Letting
+                        # it finish would cause the override the fix was
+                        # clearing.
+                        _LOGGER.warning(
+                            "%s: Stopping a clean left running by an interrupted"
+                            " fix.",
+                            self._model_id,
+                        )
+                        await self.set_deep_clean(False)
+                    else:
+                        # A clean that ends by powering the device off is over.
+                        # CLEAN=0 cannot land and is not needed -- and raising
+                        # DeviceOffError here would fail the whole connect.
+                        _LOGGER.warning(
+                            "%s: A fix's clean ended with the device off.",
+                            self._model_id,
+                        )
                     self._fix_started_clean = False
                 _LOGGER.debug("%s: Subscribe to notifications", self._model_id)
                 # Only subscribe to 4 notifications to stay within ESP32 proxy limits
@@ -402,10 +428,20 @@ class OolerBLEDevice:
                 if self._state.power != is_on:
                     self._state.power = is_on
                     changed = True
-                # OFF ends clean. Similarly, when clean mode ends, the device only sends OFF.
-                ended_a_clean = not is_on and self._state.clean
+                # OFF ends a deep clean. When one ends of its own accord the
+                # device only sends OFF, never CLEAN=0, and CLEAN is polled
+                # rather than notified -- so without this the flag would stand
+                # until the next poll.
+                ended_a_clean = not is_on and self._state.deep_clean
                 if ended_a_clean:
-                    self._state.clean = False
+                    self._state.deep_clean = False
+                    self._deep_clean_pending = False
+                    changed = True
+                # The UV cycle runs only while the unit does. Same reasoning:
+                # polled, not notified, so it is cleared here rather than up to
+                # a poll interval later.
+                if not is_on and self._state.uv_clean:
+                    self._state.uv_clean = False
                     changed = True
                 # Watch only a real on -> off transition. A notification
                 # repeating a state we already hold is not the device being
@@ -413,7 +449,7 @@ class OolerBLEDevice:
                 # reconnection after another client had it -- and watching
                 # those risks reading a stale cached setpoint as an override.
                 #
-                # A power-off that ends a clean is excluded too. A clean forces
+                # A power-off that ends a deep clean is excluded too. It forces
                 # the setpoint to CLEAN_TEMP_F and the device reverts that when
                 # the clean ends, so a revert here is expected behaviour rather
                 # than evidence -- and it looks the same whether the clean ran to
@@ -451,19 +487,20 @@ class OolerBLEDevice:
                 if self._state.set_temperature != set_temperature:
                     self._state.set_temperature = set_temperature
                     changed = True
-                    if self._state.power and not self._state.clean:
+                    forced_by_clean = (
+                        settemp_f == CLEAN_TEMP_F
+                        and (self._state.deep_clean or self._deep_clean_pending)
+                    )
+                    if self._state.power and not forced_by_clean:
                         # A person asked for this. The device changes the
-                        # setpoint by itself only while cleaning or while off.
+                        # setpoint by itself only while deep cleaning or while
+                        # off.
                         #
-                        # state.clean is polled rather than notified, but it
-                        # cannot be stale here, because a clean can only be
-                        # started by a connected client. Either we started it,
-                        # and set_clean set the flag before the device forced
-                        # its own temperature ~2s later; or another client
-                        # started it, which means it holds the device's single
-                        # connection and we are receiving nothing at all. On
-                        # reconnect, connect() polls before subscribing, so the
-                        # flag is fresh before any notification can arrive.
+                        # Keyed on the VALUE, not on the clean flag alone. The
+                        # device asserts CLEAN for its own hourly UV cycle
+                        # without touching the setpoint, and suppressing
+                        # capture through those 3-5 minutes every hour would
+                        # silently lose a temperature the user did ask for.
                         self._last_user_setpoint = set_temperature
             elif uuid == ACTUALTEMP_CHAR:
                 actualtemp_int = int.from_bytes(data, "little")
@@ -522,7 +559,10 @@ class OolerBLEDevice:
         settemp_f = int.from_bytes(settemp_byte, "little")
         actualtemp_int = int.from_bytes(actualtemp_byte, "little")
         waterlevel_int = int.from_bytes(waterlevel_byte, "little")
-        clean = bool(int.from_bytes(clean_byte, "little"))
+        clean_asserted = bool(int.from_bytes(clean_byte, "little"))
+        deep_clean, uv_clean = self._derive_clean_states(
+            clean_asserted, power, settemp_f
+        )
 
         # Use cached temperature_unit (read once on connect)
         temperature_unit = self._state.temperature_unit or "F"
@@ -558,9 +598,58 @@ class OolerBLEDevice:
             set_temperature=set_temperature,
             actual_temperature=actual_temperature,
             water_level=water_level,
-            clean=clean,
+            deep_clean=deep_clean,
+            uv_clean=uv_clean,
             temperature_unit=temperature_unit,
         )
+
+    def _derive_clean_states(
+        self, asserted: bool, power: bool, settemp_f: int
+    ) -> tuple[bool, bool]:
+        """Split an asserted CLEAN bit into the two states that share it.
+
+        The characteristic carries both the deep clean a person starts and the
+        device's own hourly UV cycle. Only a deep clean forces SET_TEMP to
+        :data:`CLEAN_TEMP_F`, so that is the discriminator -- and it is device
+        state, not provenance, so a clean started in the vendor's app is
+        recognised on the first poll after we reconnect. See CLEAN_TEMP_F in
+        const.py for the measurements behind this.
+        """
+        if not asserted:
+            self._clean_asserted_since = None
+            return False, False
+
+        now = self._monotonic()
+        if self._clean_asserted_since is None:
+            self._clean_asserted_since = now
+
+        if not power:
+            # Nothing runs on a powered-off unit, so this is neither state.
+            # Seen once, latched for ~9 hours, cause unknown. Reported rather
+            # than modelled: claiming a cycle is running here would be a
+            # statement we know to be false.
+            _LOGGER.warning(
+                "%s: CLEAN asserted while the device is off; reporting neither "
+                "a deep clean nor a UV clean.",
+                self._model_id,
+            )
+            self._fire_connection_event(
+                ConnectionEventType.CLEAN_ASSERTED_WHILE_OFF,
+                {"set_temperature": settemp_f},
+            )
+            return False, False
+
+        deep_clean = (
+            # The device forced the setpoint, which only a deep clean does.
+            settemp_f == CLEAN_TEMP_F
+            # Or we asked for one and the forced setpoint has not landed yet.
+            or self._deep_clean_pending
+            # Or it has run too long to be the UV cycle. This is the only
+            # signal for a user whose setpoint is ALREADY CLEAN_TEMP_F, where
+            # a starting deep clean changes nothing observable.
+            or now - self._clean_asserted_since >= UV_CLEAN_MAX_SECONDS
+        )
+        return deep_clean, not deep_clean
 
     async def async_poll(self) -> None:
         """Retrieve state from device.
@@ -903,28 +992,42 @@ class OolerBLEDevice:
         self._state.set_temperature = settemp_int
         self._last_user_setpoint = settemp_int
 
-    async def set_clean(self, clean: bool) -> None:
-        """Start or stop a clean cycle. Automatically powers on the device."""
+    async def set_deep_clean(self, deep_clean: bool) -> None:
+        """Start or stop a deep clean.
+
+        Starting one automatically powers on the device: a clean cannot run on
+        a unit that is off, so powering it up is part of the operation asked
+        for rather than a value cached for later.
+
+        Raises :class:`DeviceOffError` when asked to stop a clean on a device
+        that is off. The write cannot land -- the device drops writes while
+        powered down -- and there is nothing running to stop.
+
+        The device's own UV cycle is not startable or stoppable and has no
+        setter; see :attr:`OolerBLEState.uv_clean`.
+        """
         if self._client is None:
             await self.connect()
         if self._client is None:
             raise RuntimeError("Failed to connect to device")
-        # Starting a clean requires the device to be running. Stopping one does
-        # not: the device drops writes while off, so rather than waking it to
-        # land a write it will ignore, skip it — as set_temperature_unit does.
         if not self._state.power:
-            if clean:
+            if deep_clean:
                 await self.set_power(True)
             else:
-                _LOGGER.warning("Device is off; clean cannot be stopped.")
-                self._state.clean = False
-                return
+                raise DeviceOffError(
+                    f"{self._model_id}: cannot stop a deep clean while the "
+                    "device is off"
+                )
         # Set before the write: the device's forced-setpoint notification
         # arrives during the await, and a handler seeing this still false
         # records the clean's own temperature as the user's choice.
-        self._state.clean = clean
-        await self._write_gatt(CLEAN_CHAR, int(clean).to_bytes(1, "little"))
-        _LOGGER.debug("Set clean to %s.", clean)
+        self._deep_clean_pending = deep_clean
+        self._state.deep_clean = deep_clean
+        if deep_clean:
+            # Mutually exclusive by construction; a poll would say the same.
+            self._state.uv_clean = False
+        await self._write_gatt(CLEAN_CHAR, int(deep_clean).to_bytes(1, "little"))
+        _LOGGER.debug("Set deep clean to %s.", deep_clean)
 
     async def fix_setpoint_override(
         self, setpoint: int | None = None, clean_seconds: float | None = None
@@ -946,7 +1049,7 @@ class OolerBLEDevice:
         was_off = not self._state.power
         self._fix_started_clean = True
         try:
-            await self.set_clean(True)
+            await self.set_deep_clean(True)
             await asyncio.sleep(
                 FIX_CLEAN_SECONDS[-1] if clean_seconds is None else clean_seconds
             )
@@ -955,14 +1058,15 @@ class OolerBLEDevice:
             # running finishes on its own, and finishing is what causes the
             # override — the fix would become the cause.
             #
-            # Written directly rather than through set_clean, which skips the
-            # write when it believes the device is off. That guard is right for
-            # external callers but wrong here: this clean is ours, the device
-            # was powered on to start it, and a skipped write would clear the
-            # flag below while the clean was still running. _write_gatt raises
-            # if it cannot land, so the flag survives for connect() to act on.
+            # Written directly rather than through set_deep_clean, which
+            # refuses when it believes the device is off. That guard is right
+            # for external callers but wrong here: this clean is ours, the
+            # device was powered on to start it, and an exception there would
+            # leave the clean running. _write_gatt raises if it cannot land, so
+            # the flag survives for connect() to act on.
             await self._write_gatt(CLEAN_CHAR, b"\x00")
-            self._state.clean = False
+            self._state.deep_clean = False
+            self._deep_clean_pending = False
             self._fix_started_clean = False
         try:
             if setpoint is not None:

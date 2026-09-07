@@ -67,7 +67,7 @@ Main client class.
 - `set_power(bool)` -- turn device on/off (re-sends mode and temperature on power-on)
 - `set_mode(OolerMode)` -- set pump mode: `"Silent"`, `"Regular"`, or `"Boost"`. Raises `DeviceOffError` if the device is off
 - `set_temperature(int)` -- set target temperature in the current display unit. Raises `DeviceOffError` if the device is off
-- `set_clean(bool)` -- start/stop clean cycle. Starting one powers the device on; stopping one does not, since the device drops writes while off
+- `set_deep_clean(bool)` -- start/stop a deep clean. Starting one powers the device on, since a clean cannot run on a unit that is off. Stopping one raises `DeviceOffError` if the device is off: the write cannot land and there is nothing running to stop. The device's own UV cycle has no setter -- see [The CLEAN Characteristic Carries Two States](#the-clean-characteristic-carries-two-states)
 - `fix_setpoint_override(setpoint=None, clean_seconds=None)` -- clear the firmware behaviour described in [Setpoint Override After a Deep Clean](#setpoint-override-after-a-deep-clean). `setpoint=None` keeps whatever the device restores by itself
 - `set_temperature_unit(TemperatureUnit)` -- set device display unit: `"C"` or `"F"`. Raises `DeviceOffError` if the device is off
 - `address` -- BLE device address
@@ -85,7 +85,7 @@ Main client class.
 
 ### `OolerBLEState`
 
-Dataclass with fields: `power`, `mode`, `set_temperature`, `actual_temperature`, `water_level`, `clean`, `temperature_unit`.
+Dataclass with fields: `power`, `mode`, `set_temperature`, `actual_temperature`, `water_level`, `deep_clean`, `uv_clean`, `temperature_unit`.
 
 ### Sleep Schedule Types
 
@@ -98,16 +98,17 @@ Dataclass with fields: `power`, `mode`, `set_temperature`, `actual_temperature`,
 ### Connection Events
 
 - `ConnectionEvent` -- a connectivity event with `type`, `timestamp`, and optional `detail`
-- `ConnectionEventType` -- enum: `CONNECTED`, `DISCONNECTED`, `SUBSCRIPTION_MISMATCH`, `SUBSCRIPTION_RECOVERED`, `FORCED_RECONNECT`, `SETPOINT_OVERRIDE_FIXED`, `SETPOINT_OVERRIDE_UNFIXABLE`
+- `ConnectionEventType` -- enum: `CONNECTED`, `DISCONNECTED`, `SUBSCRIPTION_MISMATCH`, `SUBSCRIPTION_RECOVERED`, `FORCED_RECONNECT`, `SETPOINT_OVERRIDE_FIXED`, `SETPOINT_OVERRIDE_UNFIXABLE`, `CLEAN_ASSERTED_WHILE_OFF`
   - `SETPOINT_OVERRIDE_FIXED` -- detail `{"overrode": int, "overrode_with": int, "restored": int | None, "attempt": int}`. Worth logging; needs no attention. The fix briefly runs the pump and moves the setpoint to 75.
   - `SETPOINT_OVERRIDE_UNFIXABLE` -- detail `{"attempts": int}`. Every duration was tried and none held; the user's temperature is being discarded and nothing will correct it.
+  - `CLEAN_ASSERTED_WHILE_OFF` -- detail `{"set_temperature": int}`. A poll found the CLEAN characteristic asserted on a device that is powered off, where nothing can be running. Neither `deep_clean` nor `uv_clean` is set from it. Fires on every poll while the condition holds, so count these rather than accumulating them.
 
 ### Other Types
 
 - `OolerMode` -- `Literal["Silent", "Regular", "Boost"]`
 - `TemperatureUnit` -- `Literal["C", "F"]`
 - `OolerConnectionError` -- raised when all retry attempts are exhausted (inherits from `BleakError`)
-- `DeviceOffError` -- raised by `set_temperature`, `set_mode` and `set_temperature_unit` when the device is off. It drops writes while powered down, so these refuse rather than record a value it does not hold. Turn the device on first; `set_clean` is the exception and powers it on, since a clean physically requires it
+- `DeviceOffError` -- raised by `set_temperature`, `set_mode` and `set_temperature_unit` when the device is off. It drops writes while powered down, so these refuse rather than record a value it does not hold. Turn the device on first. `set_deep_clean(True)` is the exception and powers it on, since a clean physically requires it; `set_deep_clean(False)` raises like the rest
 
 ## Concurrency & Reconnection
 
@@ -142,7 +143,7 @@ ESP32 BLE proxies (ESPHome) have a global limit of 12 notification registrations
 
 - Power, Mode, Set Temperature, Actual Temperature
 
-Water level and clean status are **polled** (via `async_poll()`) rather than subscribed to notifications. This means two Ooler devices use 8 of 12 available slots, leaving headroom for other BLE devices.
+Water level and the CLEAN characteristic are **polled** (via `async_poll()`) rather than subscribed to notifications. This means two Ooler devices use 8 of 12 available slots, leaving headroom for other BLE devices.
 
 ### Connection slots
 
@@ -161,6 +162,24 @@ The library handles this automatically:
 - `state.actual_temperature` is passed through as-is from the device.
 
 The display unit is read once on connect and cached. It can be changed via `set_temperature_unit()`.
+
+## The CLEAN Characteristic Carries Two States
+
+`CLEAN_CHAR` is asserted for **two different things**, and the library reports them as separate fields.
+
+**Deep clean** (`state.deep_clean`) is the ~45 minute cycle a person starts, from this library or the vendor's app. It forces the setpoint to 75 for its duration, and running it to completion arms the [setpoint override](#setpoint-override-after-a-deep-clean).
+
+**UV clean** (`state.uv_clean`) is the unit's own water treatment. The manual describes "an integrated water treatment system, which includes a UV light", listed as automatic and contrasted with the Deep Clean a person enables in the app. It runs roughly **every hour of runtime for 3-5 minutes**, does not touch the setpoint, and cannot be started or stopped by anyone -- there is no setter for it.
+
+So a user watching the Ooler will see it stop cooling for a few minutes about once an hour. That is the water treatment cycle working, not a fault.
+
+**How they are told apart:** only a deep clean forces `SET_TEMP` to 75, so that is the discriminator. It is device state rather than provenance, which means a clean started in the vendor's app is recognised on the first poll after reconnecting. A second rule covers the one case the setpoint cannot decide -- a user whose setpoint is *already* 75, where a starting deep clean changes nothing observable: past `UV_CLEAN_MAX_SECONDS` (10 minutes, well outside the UV cycle and well inside a deep clean) an assertion is a deep clean whatever the setpoint says.
+
+**Known limitation:** for a user whose setpoint is 75, a UV cycle reads as `deep_clean` for its 3-5 minutes and then clears itself. Nothing acts on that -- no fix runs, no pump starts -- because the setpoint-override watch is driven by power-off notifications, not by a clean ending.
+
+Measured over 12 nights on two units, firmware 15.20: 38 clean-asserting reads captured with raw bytes, `SET_TEMP` never 75 in any of them; period exactly 60.0 minutes across ~100 consecutive gaps; zero occurrences across 437 polls on a powered-off unit; and polling 5x faster left the period unchanged, so it is the device's own clock rather than anything a client does.
+
+**Unexplained:** one unit asserted the bit continuously for ~9 hours while powered **off**, turning it on four minutes *after* the power-off. Nothing runs on a powered-off unit, so both fields read false there and `CLEAN_ASSERTED_WHILE_OFF` is emitted instead. It cleared shortly after the unit was next powered on.
 
 ## Setpoint Override After a Deep Clean
 

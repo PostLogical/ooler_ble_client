@@ -12,7 +12,8 @@ class TestOolerBLEState:
         assert state.set_temperature is None
         assert state.actual_temperature is None
         assert state.water_level is None
-        assert state.clean is None
+        assert state.deep_clean is None
+        assert state.uv_clean is None
         assert state.temperature_unit is None
 
     def test_state_with_values(self) -> None:
@@ -22,7 +23,8 @@ class TestOolerBLEState:
             set_temperature=72,
             actual_temperature=74,
             water_level=50,
-            clean=False,
+            deep_clean=False,
+            uv_clean=False,
             temperature_unit="F",
         )
         assert state.power is True
@@ -30,7 +32,8 @@ class TestOolerBLEState:
         assert state.set_temperature == 72
         assert state.actual_temperature == 74
         assert state.water_level == 50
-        assert state.clean is False
+        assert state.deep_clean is False
+        assert state.uv_clean is False
         assert state.temperature_unit == "F"
 
     def test_state_equality(self) -> None:

@@ -139,6 +139,47 @@ SCHEDULE_META_CHAR = "fa242bc0-bf85-41f7-8dbb-53ba2e8b08a3"  # read-only; firmwa
 UNKNOWN_2AAA_CHAR = "00002aaa-0000-1000-8000-00805f9b34fb"  # read/write/notify; always 0x0000
 
 # ---------------------------------------------------------------------------
+# What CLEAN_CHAR actually carries -- firmware 15.20
+# ---------------------------------------------------------------------------
+#
+# TWO different device states share this one characteristic:
+#
+#   DEEP CLEAN -- the ~45 minute cycle a person starts, from this library or
+#   the vendor's app. It FORCES SET_TEMP to CLEAN_TEMP_F for its duration, and
+#   running it to completion arms the setpoint override described below.
+#
+#   UV CLEAN -- the unit's own water treatment. The manual: "The control unit
+#   features an integrated water treatment system, which includes a UV light",
+#   listed as automatic and contrasted with the Deep Clean a person enables in
+#   the app. It runs roughly every hour of RUNTIME for 3-5 minutes, does NOT
+#   touch SET_TEMP, and cannot be started or stopped by anyone.
+#
+# So the bit alone proves nothing. THE DISCRIMINATOR IS SET_TEMP: only a deep
+# clean forces it to CLEAN_TEMP_F. Measured over 12 nights on two units
+# (local/ooler_clean_flag_20260905/):
+#
+#   - 38 clean-asserting reads captured with raw bytes; the byte is 0x01 every
+#     time, and SET_TEMP is never 0x4b (75) in any of them.
+#   - Period exactly 60.0 minutes, ~100 consecutive gaps, zero exceptions.
+#   - Only while powered: 437 polls on a powered-off unit produced nothing.
+#   - Not caused by anything we do. Polling 5x faster (5min -> 60s) left the
+#     period at exactly 60 minutes, and phase survived 7 of 7 reconnects.
+#
+# WHAT WAS BELIEVED BEFORE, AND IS WRONG: that CLEAN=1 implies a clean is
+# running, on the grounds that a clean cannot be started without a connected
+# client. The second half may still hold -- the unit has no button that starts
+# a deep clean (owner-confirmed) -- but the inference does not: the device
+# asserts this bit hourly, by itself, with nobody connected asking for it.
+# Guards that keyed on the bit now key on the derived deep-clean state instead.
+#
+# UNEXPLAINED: one unit asserted the bit continuously for ~9 hours while
+# powered OFF (2026-09-04), turning it on four minutes AFTER the power-off, so
+# it was not a cycle carrying over. Nothing runs on a powered-off unit, so
+# neither derived state is set from it; ConnectionEventType.
+# CLEAN_ASSERTED_WHILE_OFF is emitted instead. It cleared shortly after the
+# unit was next powered on.
+#
+# ---------------------------------------------------------------------------
 # Setpoint override after a deep clean -- firmware 15.20
 # ---------------------------------------------------------------------------
 #
@@ -157,11 +198,6 @@ UNKNOWN_2AAA_CHAR = "00002aaa-0000-1000-8000-00805f9b34fb"  # read/write/notify;
 # Reproduced in both directions on two devices (2026-08-26), triggered from
 # Home Assistant, the vendor's app and this library, so it is device firmware
 # rather than any client's doing.
-#
-# A clean cannot be started without a connected client: the unit has no button
-# or hold that starts one, and it cannot schedule one itself (owner-confirmed).
-# The capture guard in _handle_notification depends on this -- it is why
-# state.clean cannot be stale while we are connected and a clean is running.
 #
 # WHEN THE FIX RUNS: only on an override observed after an ordinary power-off.
 # The power-off that ends a clean is deliberately NOT watched. A clean forces
@@ -197,6 +233,17 @@ SETPOINT_OVERRIDE_WATCH_SECONDS = 120.0
 # does not work is invisible except that the setpoint is overridden again on the
 # next power-off, which is exactly when the next entry is tried.
 FIX_CLEAN_SECONDS = (0.0, 3.0, 30.0)
+
+# How long the bit may stay asserted before it cannot be a UV cycle any more.
+#
+# Backstop for the one case SET_TEMP cannot decide: a person whose setpoint is
+# ALREADY CLEAN_TEMP_F, where a starting deep clean changes nothing observable.
+# Past this, the assertion is a deep clean whatever SET_TEMP says.
+#
+# 10 minutes sits well outside the 3-5 minute UV cycle measured at 60s poll
+# resolution, and well inside the ~45 minute deep clean. The gap is wide enough
+# either way that no measurement we have comes close to the boundary.
+UV_CLEAN_MAX_SECONDS = 600.0
 
 # DEVICE_LOGS is a paging ring buffer of 6-byte records:
 #   (code: u8, param: u8, ts: int32 LE)  where ts is AGE IN SECONDS at read time.

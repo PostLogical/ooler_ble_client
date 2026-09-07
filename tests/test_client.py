@@ -22,6 +22,7 @@ from ooler_ble_client import (
 )
 from ooler_ble_client.const import (
     CLEAN_TEMP_F,
+    UV_CLEAN_MAX_SECONDS,
     FIX_CLEAN_SECONDS,
     MODE_INT_TO_MODE_STATE,
     POWER_CHAR,
@@ -239,19 +240,19 @@ class TestNotificationHandler:
     @pytest.mark.asyncio
     async def test_power_off_clears_clean(self) -> None:
         device = OolerBLEDevice(model="OOLER-TEST")
-        device._state.clean = True
+        device._state.deep_clean = True
         device._notification_handler(
             _make_sender(POWER_CHAR), bytearray(b"\x00")
         )
         assert device.state.power is False
-        assert device.state.clean is False
+        assert device.state.deep_clean is False
         await _finish_override_watch(device)
 
     @pytest.mark.asyncio
     async def test_power_off_no_callback_if_clean_already_false(self) -> None:
         device = OolerBLEDevice(model="OOLER-TEST")
         device._state.power = False
-        device._state.clean = False
+        device._state.deep_clean = False
         received: list[OolerBLEState] = []
         device.register_callback(lambda s: received.append(s))
         device._notification_handler(
@@ -622,31 +623,31 @@ class TestSetTemperature:
                 await device.set_temperature(72)
 
 
-class TestSetClean:
+class TestSetDeepClean:
     @pytest.mark.asyncio
-    async def test_set_clean_on(self) -> None:
+    async def test_set_deep_clean_on(self) -> None:
         device, client = _make_connected_device()
-        await device.set_clean(True)
-        assert device.state.clean is True
+        await device.set_deep_clean(True)
+        assert device.state.deep_clean is True
         assert device.state.power is True
 
     @pytest.mark.asyncio
-    async def test_set_clean_off(self) -> None:
+    async def test_set_deep_clean_off(self) -> None:
         device, client = _make_connected_device()
-        await device.set_clean(False)
-        assert device.state.clean is False
+        await device.set_deep_clean(False)
+        assert device.state.deep_clean is False
 
     @pytest.mark.asyncio
-    async def test_set_clean_connects_if_not_connected(self) -> None:
+    async def test_set_deep_clean_connects_if_not_connected(self) -> None:
         device = OolerBLEDevice(model="OOLER-TEST")
         device._ble_device = MagicMock()
         mock_client = _make_mock_client()
         with _patch_establish(mock_client):
-            await device.set_clean(True)
-        assert device.state.clean is True
+            await device.set_deep_clean(True)
+        assert device.state.deep_clean is True
 
     @pytest.mark.asyncio
-    async def test_set_clean_raises_if_connect_fails(self) -> None:
+    async def test_set_deep_clean_raises_if_connect_fails(self) -> None:
         device = OolerBLEDevice(model="OOLER-TEST")
         device._ble_device = MagicMock()
         with patch(
@@ -655,7 +656,7 @@ class TestSetClean:
             side_effect=BleakError("fail"),
         ):
             with pytest.raises(BleakError):
-                await device.set_clean(True)
+                await device.set_deep_clean(True)
 
 
 class TestSetTemperatureUnit:
@@ -719,7 +720,8 @@ class TestReadAllCharacteristics:
         assert state.set_temperature == 72
         assert state.actual_temperature == 74
         assert state.water_level == 50
-        assert state.clean is False
+        assert state.deep_clean is False
+        assert state.uv_clean is False
         assert state.temperature_unit == "F"
 
     @pytest.mark.asyncio
@@ -1254,11 +1256,11 @@ class TestSetterConnectFailure:
             await device.set_temperature(72)
 
     @pytest.mark.asyncio
-    async def test_set_clean_raises_if_client_still_none(self) -> None:
+    async def test_set_deep_clean_raises_if_client_still_none(self) -> None:
         device = OolerBLEDevice(model="OOLER-TEST")
         device.connect = AsyncMock()  # type: ignore[method-assign]
         with pytest.raises(RuntimeError, match="Failed to connect"):
-            await device.set_clean(True)
+            await device.set_deep_clean(True)
 
     @pytest.mark.asyncio
     async def test_set_temperature_unit_raises_if_client_still_none(self) -> None:
@@ -1519,7 +1521,10 @@ class TestStateConsistency:
         assert device.state.set_temperature == 80
         assert device.state.actual_temperature == 76
         assert device.state.water_level == 100
-        assert device.state.clean is True
+        # CLEAN asserted with the setpoint at 80, not CLEAN_TEMP_F, on a
+        # powered unit: the device's own UV cycle, not a deep clean.
+        assert device.state.deep_clean is False
+        assert device.state.uv_clean is True
 
     def test_notification_preserves_unrelated_state(self) -> None:
         """A notification for one field shouldn't affect others."""
@@ -1529,7 +1534,7 @@ class TestStateConsistency:
         device._state.set_temperature = 72
         device._state.actual_temperature = 74
         device._state.water_level = 50
-        device._state.clean = False
+        device._state.deep_clean = False
         device._state.temperature_unit = "F"
 
         # Temperature notification
@@ -1543,7 +1548,7 @@ class TestStateConsistency:
         assert device.state.mode == "Regular"
         assert device.state.set_temperature == 72
         assert device.state.water_level == 50
-        assert device.state.clean is False
+        assert device.state.deep_clean is False
         assert device.state.temperature_unit == "F"
 
 
@@ -1983,16 +1988,16 @@ class TestSetSleepSchedule:
         assert device.is_connected
 
 
-class TestSetCleanAutosPowerOn:
+class TestSetDeepCleanAutosPowerOn:
     @pytest.mark.asyncio
-    async def test_set_clean_powers_on_device(self) -> None:
+    async def test_set_deep_clean_powers_on_device(self) -> None:
         """Setting clean when device is off should auto-power-on first."""
         device, client = _make_connected_device(power=False)
-        await device.set_clean(True)
+        await device.set_deep_clean(True)
         # First write is power on, second is clean
         assert client.write_gatt_char.call_count >= 2
         assert device.state.power is True
-        assert device.state.clean is True
+        assert device.state.deep_clean is True
 
 
 class TestSleepScheduleConnectGuards:
@@ -2269,10 +2274,15 @@ class TestSetpointOverride:
     @pytest.mark.asyncio
     async def test_stopping_a_clean_does_not_wake_the_device(self) -> None:
         device, client = _make_connected_device(power=False)
-        device._state.clean = True
-        await device.set_clean(False)
+        device._state.deep_clean = True
+        with pytest.raises(DeviceOffError):
+            await device.set_deep_clean(False)
         client.write_gatt_char.assert_not_called()
         assert device.state.power is False
+        # The cached flag is NOT cleared. The write never landed, so clearing
+        # it would publish a state the device does not hold -- and the next
+        # poll would put it straight back.
+        assert device.state.deep_clean is True
 
     @pytest.mark.asyncio
     async def test_override_while_off_is_fixed_and_the_setpoint_restored(self) -> None:
@@ -2305,11 +2315,11 @@ class TestSetpointOverride:
         with 85, and an earlier version wrote 75 back."""
         device, _client = _make_connected_device(power=True)
         await device.set_temperature(85)
-        device._state.clean = True
+        device._state.deep_clean = True
         device._notification_handler(
             _make_sender(SETTEMP_CHAR), bytearray(bytes([CLEAN_TEMP_F]))
         )
-        device._state.clean = False
+        device._state.deep_clean = False
         device._state.power = False
 
         async def _device_overrides(_delay: float) -> None:
@@ -2484,6 +2494,28 @@ class TestSetpointOverride:
         await _finish_override_watch(device)
 
     @pytest.mark.asyncio
+    async def test_connecting_to_an_off_device_does_not_fail_on_the_fix_cleanup(
+        self,
+    ) -> None:
+        """A clean that ends by powering the device off is already over, and
+        CLEAN=0 cannot land. set_deep_clean would raise DeviceOffError here,
+        and connect()'s post-setup handler would turn that into a failed
+        connection."""
+        mock_client = _make_mock_client(
+            [_TEMP_UNIT_F] + _clean_reads(power=False, settemp_f=66, asserted=False)
+        )
+        device = OolerBLEDevice(model="OOLER-TEST")
+        device.set_ble_device(MagicMock())
+        device._fix_started_clean = True
+        with _patch_establish(mock_client):
+            await device.connect()
+        assert device._fix_started_clean is False
+        assert CLEAN_CHAR not in [
+            c.args[0] for c in mock_client.write_gatt_char.call_args_list
+        ]
+        await _finish_override_watch(device)
+
+    @pytest.mark.asyncio
     async def test_a_clean_we_started_does_not_pose_as_the_users_choice(self) -> None:
         """The device forces its own temperature a couple of seconds into a
         clean. state.clean is polled, but it cannot be stale here: a clean can
@@ -2503,7 +2535,7 @@ class TestSetpointOverride:
                 )
 
         client.write_gatt_char = AsyncMock(side_effect=_forced_during_write)
-        await device.set_clean(True)
+        await device.set_deep_clean(True)
 
         assert device.state.set_temperature == CLEAN_TEMP_F  # reported faithfully
         assert device._last_user_setpoint == 62  # but not mistaken for intent
@@ -2534,12 +2566,12 @@ class TestSetpointOverride:
         it would run a fix clean on a device that was never armed."""
         device, _client = _make_connected_device(power=True)
         device._last_notified_power = True
-        device._state.clean = True
+        device._state.deep_clean = True
         device._state.set_temperature = CLEAN_TEMP_F
 
         device._notification_handler(_make_sender(POWER_CHAR), bytearray(b"\x00"))
 
-        assert device.state.clean is False
+        assert device.state.deep_clean is False
         assert device._setpoint_override_watch is None
 
     @pytest.mark.asyncio
@@ -2599,3 +2631,184 @@ class TestSetpointOverride:
             await device.fix_setpoint_override(setpoint=62)
 
         assert device.state.power is False
+
+
+# ============================================================================
+# Splitting the CLEAN characteristic into its two device states.
+#
+# The bit carries both the deep clean a person starts and the device's own
+# hourly UV cycle. Only a deep clean forces SET_TEMP to CLEAN_TEMP_F, and that
+# is the whole discriminator. See CLEAN_TEMP_F in const.py.
+# ============================================================================
+
+def _clean_reads(*, power: bool, settemp_f: int, asserted: bool) -> list[bytes]:
+    """GATT read responses with the CLEAN bit and setpoint set deliberately."""
+    return [
+        int(power).to_bytes(1, "little"),
+        b"\x01",                          # mode = Regular
+        settemp_f.to_bytes(1, "little"),
+        b"\x4a",                          # actualtemp = 74
+        b"\x32",                          # water_level = 50
+        int(asserted).to_bytes(1, "little"),
+    ]
+
+
+class TestCleanStateSplit:
+    @pytest.mark.asyncio
+    async def test_forced_setpoint_means_deep_clean_whoever_started_it(
+        self,
+    ) -> None:
+        """The scenario this derivation exists for: someone starts a deep clean
+        in the vendor's app while we are disconnected, and we have to recognise
+        it on the first poll back without ever having seen the write."""
+        device, client = _make_connected_device()
+        client.read_gatt_char = AsyncMock(
+            side_effect=_clean_reads(
+                power=True, settemp_f=CLEAN_TEMP_F, asserted=True
+            )
+        )
+        state = await device._read_all_characteristics()
+        assert state.deep_clean is True
+        assert state.uv_clean is False
+        assert device._deep_clean_pending is False  # provenance played no part
+
+    @pytest.mark.asyncio
+    async def test_asserted_without_a_forced_setpoint_is_the_uv_cycle(
+        self,
+    ) -> None:
+        device, client = _make_connected_device()
+        client.read_gatt_char = AsyncMock(
+            side_effect=_clean_reads(power=True, settemp_f=66, asserted=True)
+        )
+        state = await device._read_all_characteristics()
+        assert state.uv_clean is True
+        assert state.deep_clean is False
+
+    @pytest.mark.asyncio
+    async def test_asserted_too_long_is_a_deep_clean_whatever_the_setpoint(
+        self,
+    ) -> None:
+        """The backstop, and the only signal for a user whose setpoint is
+        already CLEAN_TEMP_F: past the UV window, it cannot be the UV cycle."""
+        device, client = _make_connected_device()
+        now = 1000.0
+        device._monotonic = lambda: now
+        client.read_gatt_char = AsyncMock(
+            side_effect=_clean_reads(power=True, settemp_f=66, asserted=True)
+        )
+        first = await device._read_all_characteristics()
+        assert first.uv_clean is True
+
+        now += UV_CLEAN_MAX_SECONDS
+        client.read_gatt_char = AsyncMock(
+            side_effect=_clean_reads(power=True, settemp_f=66, asserted=True)
+        )
+        later = await device._read_all_characteristics()
+        assert later.deep_clean is True
+        assert later.uv_clean is False
+
+    @pytest.mark.asyncio
+    async def test_the_assertion_clock_restarts_when_the_bit_clears(self) -> None:
+        """Otherwise an hour of UV cycles would eventually accumulate past the
+        backstop and every one of them would read as a deep clean."""
+        device, client = _make_connected_device()
+        now = 1000.0
+        device._monotonic = lambda: now
+
+        for _ in range(3):
+            client.read_gatt_char = AsyncMock(
+                side_effect=_clean_reads(power=True, settemp_f=66, asserted=True)
+            )
+            assert (await device._read_all_characteristics()).uv_clean is True
+            now += 300.0
+            client.read_gatt_char = AsyncMock(
+                side_effect=_clean_reads(
+                    power=True, settemp_f=66, asserted=False
+                )
+            )
+            assert (await device._read_all_characteristics()).uv_clean is False
+            now += 3300.0
+
+        assert device._clean_asserted_since is None
+
+    @pytest.mark.asyncio
+    async def test_asserted_while_off_is_neither_state_and_is_reported(
+        self,
+    ) -> None:
+        """Nothing runs on a powered-off unit. Observed once, latched ~9 hours;
+        claiming a cycle is running there would be a statement known to be
+        false, so it is reported instead of modelled."""
+        device, client = _make_connected_device(power=False)
+        events: list[ConnectionEvent] = []
+        device.register_connection_event_callback(events.append)
+        client.read_gatt_char = AsyncMock(
+            side_effect=_clean_reads(power=False, settemp_f=66, asserted=True)
+        )
+        state = await device._read_all_characteristics()
+
+        assert state.deep_clean is False
+        assert state.uv_clean is False
+        assert [e.type for e in events] == [
+            ConnectionEventType.CLEAN_ASSERTED_WHILE_OFF
+        ]
+        assert events[0].detail == {"set_temperature": 66}
+
+    def test_a_uv_cycle_does_not_swallow_the_users_setpoint(self) -> None:
+        """The bug this split fixes on the capture side: for 3-5 minutes every
+        hour, a temperature the user really did ask for went unrecorded."""
+        device = OolerBLEDevice(model="OOLER-TEST")
+        device._state.power = True
+        device._state.temperature_unit = "F"
+        device._state.uv_clean = True
+        device._state.deep_clean = False
+
+        device._notification_handler(
+            _make_sender(SETTEMP_CHAR), bytearray(b"\x42")  # 66
+        )
+
+        assert device._last_user_setpoint == 66
+
+    def test_a_deep_cleans_forced_setpoint_is_still_not_the_users_choice(
+        self,
+    ) -> None:
+        device = OolerBLEDevice(model="OOLER-TEST")
+        device._state.power = True
+        device._state.temperature_unit = "F"
+        device._state.deep_clean = True
+
+        device._notification_handler(
+            _make_sender(SETTEMP_CHAR),
+            bytearray(CLEAN_TEMP_F.to_bytes(1, "little")),
+        )
+
+        assert device._last_user_setpoint is None
+
+    def test_a_uv_cycle_at_75_is_the_documented_residual(self) -> None:
+        """A user whose setpoint IS CLEAN_TEMP_F makes a UV cycle look like a
+        deep clean. Bounded at the length of one cycle and self-clearing; the
+        alternative is delaying every real detection by the backstop window."""
+        device = OolerBLEDevice(model="OOLER-TEST")
+        device._monotonic = lambda: 1000.0
+        deep, uv = device._derive_clean_states(
+            asserted=True, power=True, settemp_f=CLEAN_TEMP_F
+        )
+        assert (deep, uv) == (True, False)
+
+    @pytest.mark.asyncio
+    async def test_power_off_clears_the_uv_cycle_too(self) -> None:
+        """CLEAN is polled rather than notified, so without this a UV cycle
+        would appear to keep running for up to a poll interval after the unit
+        was switched off."""
+        device = OolerBLEDevice(model="OOLER-TEST")
+        device._state.power = True
+        device._state.uv_clean = True
+        received: list[OolerBLEState] = []
+        device.register_callback(received.append)
+
+        device._notification_handler(
+            _make_sender(POWER_CHAR), bytearray(b"\x00")
+        )
+
+        assert device.state.uv_clean is False
+        assert received
+        await _finish_override_watch(device)

@@ -147,7 +147,8 @@ class TestCheckNotifyConsistency:
             set_temperature=72,
             actual_temperature=74,
             water_level=50,
-            clean=False,
+            deep_clean=False,
+            uv_clean=False,
             temperature_unit="F",
         )
         assert device._check_notify_consistency(fresh) == set()
@@ -162,7 +163,8 @@ class TestCheckNotifyConsistency:
             set_temperature=72,
             actual_temperature=76,  # differs from cached 74
             water_level=50,
-            clean=False,
+            deep_clean=False,
+            uv_clean=False,
             temperature_unit="F",
         )
         assert device._check_notify_consistency(fresh) == {"actual_temperature"}
@@ -177,7 +179,8 @@ class TestCheckNotifyConsistency:
             set_temperature=72,
             actual_temperature=74,
             water_level=50,
-            clean=False,
+            deep_clean=False,
+            uv_clean=False,
             temperature_unit="F",
         )
         assert device._check_notify_consistency(fresh) == {"power", "mode"}
@@ -195,7 +198,8 @@ class TestCheckNotifyConsistency:
             set_temperature=72,
             actual_temperature=74,
             water_level=50,
-            clean=False,
+            deep_clean=False,
+            uv_clean=False,
             temperature_unit="F",
         )
         assert device._check_notify_consistency(fresh) == set()

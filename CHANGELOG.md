@@ -1,5 +1,52 @@
 # Changelog
 
+## 1.1.0b12
+
+### Breaking
+- **`state.clean` is gone, replaced by `state.deep_clean` and `state.uv_clean`;
+  `set_clean()` is now `set_deep_clean()`.** The name is removed rather than
+  narrowed so that every call site fails loudly instead of continuing to compile
+  with a changed meaning.
+- **`set_deep_clean(False)` raises `DeviceOffError` when the device is off.** It
+  previously logged a warning, set the cached flag to false and returned. The
+  write cannot land -- the device drops writes while powered down -- and the
+  cached value was a state the device did not hold, so the next poll re-read the
+  bit and put it straight back. Matches the 1.1.0b8 precedent for the other
+  setters. `set_deep_clean(True)` still powers the device on, since a clean
+  cannot run on a unit that is off.
+
+### Fixed
+- **The CLEAN characteristic carries two device states, and both were being read
+  as a deep clean.** Besides the ~45 minute cycle a person starts, the unit
+  asserts the same bit for 3-5 minutes roughly every hour of runtime, without
+  forcing the setpoint -- the integrated UV water treatment the manual
+  describes. Two guards keyed on the bit and so mis-fired through that window
+  every hour:
+  - A temperature the user set during the window was not recorded as theirs, so
+    a later setpoint-override fix would restore a stale value or none at all.
+  - A power-off during the window was read as a deep clean ending, which
+    suppressed setpoint-override detection for that power-off.
+
+  Both now key on `deep_clean`, which is derived from device state rather than
+  from who started the clean: the forced setpoint of `CLEAN_TEMP_F` identifies a
+  real deep clean even when the vendor's app started it while we were
+  disconnected, and `UV_CLEAN_MAX_SECONDS` backstops the one case the setpoint
+  cannot decide.
+
+### Added
+- `ConnectionEventType.CLEAN_ASSERTED_WHILE_OFF`, detail
+  `{"set_temperature": int}`. One unit asserted CLEAN continuously for ~9 hours
+  while powered off, starting four minutes after the power-off. Nothing runs on a
+  powered-off unit, so neither field is set from it and the reading is reported
+  instead. Fires per poll while the condition holds -- count these rather than
+  accumulating them.
+- `UV_CLEAN_MAX_SECONDS` (600.0) in `const.py`.
+
+### Notes
+The evidence behind all of this -- 38 raw-byte captures, the exact 60.0 minute
+period, the powered-off control, and the poll-rate test that rules out anything
+client-side -- is in `local/ooler_clean_flag_20260905/`.
+
 ## 1.1.0b11
 
 ### Fixed

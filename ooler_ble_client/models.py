@@ -34,7 +34,14 @@ class OolerBLEState:
     set_temperature: int | None = None
     actual_temperature: int | None = None
     water_level: int | None = None
-    clean: bool | None = None
+    #: A deep clean -- the ~45 minute cycle a person starts, and the one that
+    #: arms the setpoint override. See CLEAN_TEMP_F in const.py for how it is
+    #: told apart from the UV cycle below, which shares its characteristic.
+    deep_clean: bool | None = None
+    #: The device's own water-treatment cycle: roughly every hour of runtime,
+    #: 3-5 minutes, not startable or stoppable by anyone. See UV_CLEAN_MAX_
+    #: SECONDS in const.py.
+    uv_clean: bool | None = None
     temperature_unit: TemperatureUnit | None = None
 
 
@@ -62,6 +69,18 @@ class ConnectionEventType(Enum):
     #: temperature is being discarded and nothing will correct it.
     #: ``detail`` carries ``attempts``.
     SETPOINT_OVERRIDE_UNFIXABLE = "setpoint_override_unfixable"
+    #: A poll found the CLEAN characteristic asserted on a device that is
+    #: powered off. Nothing runs on a powered-off unit, so neither
+    #: :attr:`OolerBLEState.deep_clean` nor :attr:`OolerBLEState.uv_clean` is
+    #: set from it -- this event is how the reading stays visible. Observed
+    #: once, latched for ~9 hours, cause unknown; see CLEAN_TEMP_F in const.py.
+    #: ``detail`` carries ``set_temperature``, so a later reader can tell
+    #: whether the setpoint looked forced at the time.
+    #:
+    #: Fires on every poll while the condition holds -- ~108 times over a
+    #: nine-hour latch at a five-minute cadence -- so count these rather than
+    #: accumulating them.
+    CLEAN_ASSERTED_WHILE_OFF = "clean_asserted_while_off"
 
 
 @dataclass(frozen=True)
