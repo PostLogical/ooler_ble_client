@@ -1,5 +1,48 @@
 # Changelog
 
+## 1.1.0b13
+
+### Added
+- **`RUNTIME` and `UV_RUNTIME` on the `Raw reads` DEBUG line.** The UV cycle
+  appears to run on accumulated runtime rather than wall clock: recorder
+  history puts cycles exactly 60.0 minutes apart while the unit runs, ~100
+  consecutive gaps across 12 nights, and `RUNTIME` advances 1/s while powered.
+  If that holds, a cycle's timing is predictable from `RUNTIME`, and an
+  assertion outside the expected window could only be a deep clean — a
+  discriminator needing no setpoint, temperature or effort. One measured cycle
+  put `RUNTIME` mod 3600 at 2251.
+
+  Two variants fit everything measured so far and cannot yet be separated:
+  cycles at a fixed phase of `RUNTIME`, or cycles due 3600s of runtime after
+  the previous one *ended*. They differ when something interrupts, and a deep
+  clean runs the lamp for ~45 minutes, so it may restart the timer. `RUNTIME`
+  also loses time across an abrupt power loss, so it can go backwards. Any
+  consumer building on this must re-learn the phase after a clean or a
+  backwards step rather than trusting it indefinitely.
+
+  Answering this needs `RUNTIME` recorded beside the clean bit across many
+  cycles and both units, which logging collects from ordinary use. Measuring it
+  by holding the connection costs the integration its device and does not scale
+  past a single session.
+
+  Read **only when DEBUG is enabled** for the `ooler_ble_client` logger, so
+  nobody else pays two extra GATT reads per poll for diagnostics they are not
+  collecting, and read failures are swallowed — a diagnostic must never be able
+  to fail a poll. **No API change: consumers need only bump the version.**
+
+### Fixed
+- README claimed the UV cycle stops the unit cooling. It does not: measured
+  across a full cycle the unit kept regulating and the water held at the
+  setpoint. It is the deep clean that drives temperature, 74°F to 78°F in under
+  two minutes past a setpoint of 75.
+
+### Notes
+`THERMAL_EFFORT` was investigated as a way to tell a deep clean from a UV cycle
+and rejected. It falls to near zero during ordinary cooling/heating changeovers,
+during a UV cycle, and at small temperature deltas under normal control, so it
+separates nothing. `diagnostics/thermal_effort_trial.py` is the harness that
+established this and can drive further trials.
+
 ## 1.1.0b12
 
 ### Breaking

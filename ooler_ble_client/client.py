@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import struct
 import time
 from collections.abc import Callable, Coroutine
@@ -38,6 +39,8 @@ from .const import (
     CLEAN_CHAR,
     CLEAN_TEMP_F,
     UV_CLEAN_MAX_SECONDS,
+    RUNTIME_CHAR,
+    UV_RUNTIME_CHAR,
     FIX_CLEAN_SECONDS,
     SETPOINT_OVERRIDE_WATCH_SECONDS,
     DISPLAY_TEMPERATURE_UNIT_CHAR,
@@ -535,7 +538,7 @@ class OolerBLEDevice:
         # Only the raw responses show which happened, so log them.
         _LOGGER.debug(
             "%s: Raw reads: power=%s mode=%s settemp=%s actualtemp=%s"
-            " water=%s clean=%s",
+            " water=%s clean=%s%s",
             self._model_id,
             _hex(power_byte),
             _hex(mode_byte),
@@ -543,6 +546,7 @@ class OolerBLEDevice:
             _hex(actualtemp_byte),
             _hex(waterlevel_byte),
             _hex(clean_byte),
+            await self._counter_diagnostics(client),
         )
 
         power = bool(int.from_bytes(power_byte, "little"))
@@ -602,6 +606,44 @@ class OolerBLEDevice:
             uv_clean=uv_clean,
             temperature_unit=temperature_unit,
         )
+
+    async def _counter_diagnostics(self, client: BleakClientWithServiceCache) -> str:
+        """Read the runtime counters, for the Raw reads line only.
+
+        The device's UV cycle appears to run on accumulated runtime rather
+        than wall clock: recorder history puts cycles exactly 60.0 minutes
+        apart while the unit runs, ~100 consecutive gaps over 12 nights, and
+        RUNTIME advances 1/s while powered. If that holds, a cycle's timing is
+        predictable from RUNTIME, and an assertion outside the expected window
+        could only be a deep clean -- a discriminator needing no setpoint,
+        temperature or effort. One measured cycle put RUNTIME mod 3600 at 2251.
+
+        Two variants fit everything measured and cannot yet be separated:
+        cycles at a fixed phase of RUNTIME, or cycles due 3600s of runtime
+        after the previous one ENDED. They differ when something interrupts,
+        and a deep clean runs the lamp for ~45 minutes, so it may well restart
+        the timer. RUNTIME also loses time across an abrupt power loss (see
+        UNKNOWN_9A5F_CHAR in const.py), so it can go backwards. Any consumer
+        building on this re-learns the phase after a clean or a backwards step
+        rather than trusting it indefinitely.
+
+        Answering it needs RUNTIME recorded beside the clean bit across many
+        cycles and both units, which this collects from ordinary use. Holding
+        the connection to measure it directly costs the integration its device
+        and does not scale past a single session.
+
+        Read only when DEBUG is enabled, so nobody else pays two extra GATT
+        reads per poll for diagnostics they are not collecting. Failures are
+        swallowed: a diagnostic must never be able to fail a poll.
+        """
+        if not _LOGGER.isEnabledFor(logging.DEBUG):
+            return ""
+        try:
+            runtime = await client.read_gatt_char(RUNTIME_CHAR)
+            uv_runtime = await client.read_gatt_char(UV_RUNTIME_CHAR)
+        except Exception:  # noqa: BLE001 - never break a poll for a log line
+            return " runtime=? uv_runtime=?"
+        return f" runtime={_hex(runtime)} uv_runtime={_hex(uv_runtime)}"
 
     def _derive_clean_states(
         self, asserted: bool, power: bool, settemp_f: int

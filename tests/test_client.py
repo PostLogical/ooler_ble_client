@@ -2812,3 +2812,50 @@ class TestCleanStateSplit:
         assert device.state.uv_clean is False
         assert received
         await _finish_override_watch(device)
+
+
+class TestCounterDiagnostics:
+    """RUNTIME/UV_RUNTIME on the Raw reads line, to test whether the UV cycle
+    is keyed to accumulated runtime. Collected from ordinary use, because
+    holding the connection ourselves costs the integration its device and does
+    not scale past one session."""
+
+    @pytest.mark.asyncio
+    async def test_not_read_when_debug_is_off(self, caplog) -> None:
+        """Nobody should pay two extra GATT reads per poll for diagnostics
+        they are not collecting."""
+        device, client = _make_connected_device()
+        client.read_gatt_char = AsyncMock(side_effect=_GATT_READS_F)
+        with caplog.at_level(logging.INFO, logger="ooler_ble_client"):
+            await device._read_all_characteristics()
+        assert client.read_gatt_char.call_count == len(_GATT_READS_F)
+
+    @pytest.mark.asyncio
+    async def test_read_and_logged_when_debug_is_on(self, caplog) -> None:
+        device, client = _make_connected_device()
+        client.read_gatt_char = AsyncMock(
+            side_effect=[*_GATT_READS_F, b"\x82\xc6\x15\x00", b"\xce\x93\xf4\xff"]
+        )
+        with caplog.at_level(logging.DEBUG, logger="ooler_ble_client"):
+            await device._read_all_characteristics()
+        raw = [r.getMessage() for r in caplog.records if "Raw reads" in r.getMessage()]
+        assert raw, "expected a Raw reads line"
+        assert "runtime=82c61500" in raw[0]
+        assert "uv_runtime=ce93f4ff" in raw[0]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_counter_read_does_not_fail_the_poll(
+        self, caplog
+    ) -> None:
+        """A diagnostic must never cost a poll. Raising here would trigger the
+        reconnect path and discard state we had already read successfully."""
+        device, client = _make_connected_device()
+        client.read_gatt_char = AsyncMock(
+            side_effect=[*_GATT_READS_F, BleakError("boom")]
+        )
+        with caplog.at_level(logging.DEBUG, logger="ooler_ble_client"):
+            state = await device._read_all_characteristics()
+        assert state.power is True
+        assert state.set_temperature == 72
+        raw = [r.getMessage() for r in caplog.records if "Raw reads" in r.getMessage()]
+        assert raw and "runtime=?" in raw[0]

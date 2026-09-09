@@ -169,9 +169,9 @@ The display unit is read once on connect and cached. It can be changed via `set_
 
 **Deep clean** (`state.deep_clean`) is the ~45 minute cycle a person starts, from this library or the vendor's app. It forces the setpoint to 75 for its duration, and running it to completion arms the [setpoint override](#setpoint-override-after-a-deep-clean).
 
-**UV clean** (`state.uv_clean`) is the unit's own water treatment. The manual describes "an integrated water treatment system, which includes a UV light", listed as automatic and contrasted with the Deep Clean a person enables in the app. It runs roughly **every hour of runtime for 3-5 minutes**, does not touch the setpoint, and cannot be started or stopped by anyone -- there is no setter for it.
+**UV clean** (`state.uv_clean`) is the unit's own water treatment. The manual describes "an integrated water treatment system, which includes a UV light", listed as automatic and contrasted with the Deep Clean a person enables in the app. It runs roughly **every hour of runtime**, for 231 seconds in the one cycle measured end to end, does not touch the setpoint, and cannot be started or stopped by anyone -- there is no setter for it.
 
-So a user watching the Ooler will see it stop cooling for a few minutes about once an hour. That is the water treatment cycle working, not a fault.
+The UV cycle does **not** interrupt temperature control: measured over a full cycle, the unit kept regulating throughout and the water held at the setpoint. A deep clean is the opposite -- it drives the water up regardless of the setpoint, 74°F to 78°F in under two minutes in one measurement, past a setpoint of 75.
 
 **How they are told apart:** only a deep clean forces `SET_TEMP` to 75, so that is the discriminator. It is device state rather than provenance, which means a clean started in the vendor's app is recognised on the first poll after reconnecting. A second rule covers the one case the setpoint cannot decide -- a user whose setpoint is *already* 75, where a starting deep clean changes nothing observable: past `UV_CLEAN_MAX_SECONDS` (10 minutes, well outside the UV cycle and well inside a deep clean) an assertion is a deep clean whatever the setpoint says.
 
