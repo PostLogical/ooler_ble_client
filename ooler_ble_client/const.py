@@ -103,6 +103,18 @@ DEVICE_LOGS_CHAR = "e6a505a4-9f0b-4755-b234-13243240da23"  # read; rolling event
 # April logging. A runtime-proportional model was tried and falsified: RUNTIME and
 # LIFETIME both DECREASE across an abrupt power loss (603 lost 6,353 and 9,182
 # respectively), so they are not monotonic and cannot support that inference.
+#
+# Backwards steps are NOT confined to power loss. On 2026-09-09 RUNTIME on 601
+# dropped by exactly 131,072 -- two whole units of byte 2 -- between consecutive
+# 60s polls on a unit that stayed powered and connected, with the low 16 bits
+# still counting normally through the step and the value never recovering.
+# Adding 131,072 back makes the UV cycle's period residuals exactly zero either
+# side, so the schedule's own clock did not move: the step is in this exposed
+# counter alone. A single-bit fault is a poor fit for an event seen inside one
+# night of testing; block-structured storage, or a stale periodically-committed
+# high half composed with a live low half, would produce an exact multiple of
+# 65,536 as a matter of course. LIFETIME is logged beside RUNTIME from 1.1.0b14
+# to show whether the two step together.
 UNKNOWN_9A5F_CHAR = "9a5f99ef-4370-4e87-a073-7769cd8dd35c"  # read; e.g. "1.79"
 # Unknown purpose; read/notify. Always 0x00 across all testing.
 UNKNOWN_51B9_CHAR = "51b91d16-ff96-459d-aa02-0895044be049"

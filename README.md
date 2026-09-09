@@ -169,7 +169,7 @@ The display unit is read once on connect and cached. It can be changed via `set_
 
 **Deep clean** (`state.deep_clean`) is the ~45 minute cycle a person starts, from this library or the vendor's app. It forces the setpoint to 75 for its duration, and running it to completion arms the [setpoint override](#setpoint-override-after-a-deep-clean).
 
-**UV clean** (`state.uv_clean`) is the unit's own water treatment. The manual describes "an integrated water treatment system, which includes a UV light", listed as automatic and contrasted with the Deep Clean a person enables in the app. It runs roughly **every hour of runtime**, for 231 seconds in the one cycle measured end to end, does not touch the setpoint, and cannot be started or stopped by anyone -- there is no setter for it.
+**UV clean** (`state.uv_clean`) is the unit's own water treatment. The manual describes "an integrated water treatment system, which includes a UV light", listed as automatic and contrasted with the Deep Clean a person enables in the app. It runs **every 3602 seconds of runtime** and burns **exactly 240 lamp seconds** each time (16 of 16 complete cycles measured), does not touch the setpoint, and cannot be started or stopped by anyone -- there is no setter for it. Note the period is 3602 rather than 3600: measured against 3600 the phase drifts about 48 seconds a day.
 
 The UV cycle does **not** interrupt temperature control: measured over a full cycle, the unit kept regulating throughout and the water held at the setpoint. A deep clean is the opposite -- it drives the water up regardless of the setpoint, 74°F to 78°F in under two minutes in one measurement, past a setpoint of 75.
 
@@ -179,7 +179,9 @@ The UV cycle does **not** interrupt temperature control: measured over a full cy
 
 Measured over 12 nights on two units, firmware 15.20: 38 clean-asserting reads captured with raw bytes, `SET_TEMP` never 75 in any of them; period exactly 60.0 minutes across ~100 consecutive gaps; zero occurrences across 437 polls on a powered-off unit; and polling 5x faster left the period unchanged, so it is the device's own clock rather than anything a client does.
 
-**Unexplained:** one unit asserted the bit continuously for ~9 hours while powered **off**, turning it on four minutes *after* the power-off. Nothing runs on a powered-off unit, so both fields read false there and `CLEAN_ASSERTED_WHILE_OFF` is emitted instead. It cleared shortly after the unit was next powered on.
+**CLEAN asserted while off** is an *interrupted* UV cycle, not a separate fault. Powering the unit off mid-cycle freezes the whole device state together -- one capture shows `RUNTIME` and `UV_RUNTIME` stuck at 171 seconds of 240 across 84 consecutive polls -- and the CLEAN bit is never cleared because the state machine stopped. That is why the assertion can persist for hours and why powering on clears it. Nothing is running on a powered-off unit, so both derived fields read false and `CLEAN_ASSERTED_WHILE_OFF` is emitted instead.
+
+Consequence for anything timing-based: a cycle cannot be assumed to end on schedule. "A cycle is due" still evaluates correctly, because `RUNTIME` freezes along with everything else, but "the cycle should be over by now" does not.
 
 ## Setpoint Override After a Deep Clean
 

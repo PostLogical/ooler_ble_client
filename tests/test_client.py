@@ -2834,7 +2834,12 @@ class TestCounterDiagnostics:
     async def test_read_and_logged_when_debug_is_on(self, caplog) -> None:
         device, client = _make_connected_device()
         client.read_gatt_char = AsyncMock(
-            side_effect=[*_GATT_READS_F, b"\x82\xc6\x15\x00", b"\xce\x93\xf4\xff"]
+            side_effect=[
+                *_GATT_READS_F,
+                b"\x82\xc6\x15\x00",   # runtime
+                b"\xce\x93\xf4\xff",   # uv_runtime
+                b"\xc0\x18\x2d\x00",   # lifetime
+            ]
         )
         with caplog.at_level(logging.DEBUG, logger="ooler_ble_client"):
             await device._read_all_characteristics()
@@ -2842,6 +2847,7 @@ class TestCounterDiagnostics:
         assert raw, "expected a Raw reads line"
         assert "runtime=82c61500" in raw[0]
         assert "uv_runtime=ce93f4ff" in raw[0]
+        assert "lifetime=c0182d00" in raw[0]
 
     @pytest.mark.asyncio
     async def test_a_failed_counter_read_does_not_fail_the_poll(

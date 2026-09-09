@@ -1,5 +1,38 @@
 # Changelog
 
+## 1.1.0b14
+
+### Added
+- **`LIFETIME` on the `Raw reads` DEBUG line**, beside `RUNTIME` and
+  `UV_RUNTIME`. `RUNTIME` is known to step backwards — by 6,353 and 9,182
+  across an abrupt power loss, and once by exactly 131,072 on a unit that
+  stayed powered and connected throughout, with the low 16 bits still counting
+  normally and the value never recovering. Adding 131,072 back makes the UV
+  cycle's period residuals exactly zero either side, so the schedule's own
+  clock never moved. `LIFETIME` shows whether the two counters step together
+  (shared storage or readout) or independently (a reference to measure against).
+  Same DEBUG gate, same swallowed failures, no API change.
+
+### Fixed
+Documentation, corrected by a night of instrumented collection — 1249 reads,
+17 cycles, two units:
+
+- **A UV cycle is 240 lamp seconds, not 231.** The earlier figure came from
+  bracketing between polls; `UV_RUNTIME` dates both edges to the second.
+- **The period is 3602 runtime ticks, not 3600.** Robooler's residuals were
+  exactly 0.0 across 9 cycles. Against a 3600 model the phase drifts ~48s a
+  day, so a discriminator must use 3602 or re-learn.
+- **`UV_RUNTIME` does not creep between cycles.** Zero across 1200+ intervals;
+  an earlier +10s observation was a session-boundary artifact.
+- **"CLEAN asserted while off" is an interrupted cycle**, not an unexplained
+  latch. Powering off mid-cycle freezes the whole device state — one capture
+  froze at 171 of 240 lamp seconds across 84 polls — and the bit is never
+  cleared because the state machine stopped. Timing rules can still ask
+  "is a cycle due" but not "should it be over".
+- **Backwards steps in `RUNTIME` are not confined to power loss**, and the
+  observed one was an exact multiple of 65,536, which points at
+  block-structured storage rather than a fault.
+
 ## 1.1.0b13
 
 ### Added

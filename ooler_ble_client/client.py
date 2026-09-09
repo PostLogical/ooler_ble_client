@@ -39,6 +39,7 @@ from .const import (
     CLEAN_CHAR,
     CLEAN_TEMP_F,
     UV_CLEAN_MAX_SECONDS,
+    LIFETIME_CHAR,
     RUNTIME_CHAR,
     UV_RUNTIME_CHAR,
     FIX_CLEAN_SECONDS,
@@ -610,29 +611,43 @@ class OolerBLEDevice:
     async def _counter_diagnostics(self, client: BleakClientWithServiceCache) -> str:
         """Read the runtime counters, for the Raw reads line only.
 
-        The device's UV cycle appears to run on accumulated runtime rather
-        than wall clock: recorder history puts cycles exactly 60.0 minutes
-        apart while the unit runs, ~100 consecutive gaps over 12 nights, and
-        RUNTIME advances 1/s while powered. If that holds, a cycle's timing is
-        predictable from RUNTIME, and an assertion outside the expected window
-        could only be a deep clean -- a discriminator needing no setpoint,
-        temperature or effort. One measured cycle put RUNTIME mod 3600 at 2251.
+        The device's UV cycle runs on accumulated runtime, not wall clock. Over
+        17 cycles on two units at 60s polling, consecutive starts are 3602
+        RUNTIME ticks apart -- not 3600. Robooler's residuals were exactly 0.0
+        across 9 cycles; Tawaret averaged 3601.94. Cycle starts are dated from
+        the counters alone, as rt - (uv_runtime - uv_runtime_previous_poll),
+        which is exact to 1s because UV_RUNTIME is frozen between cycles.
 
-        Two variants fit everything measured and cannot yet be separated:
-        cycles at a fixed phase of RUNTIME, or cycles due 3600s of runtime
-        after the previous one ENDED. They differ when something interrupts,
-        and a deep clean runs the lamp for ~45 minutes, so it may well restart
-        the timer. RUNTIME also loses time across an abrupt power loss (see
-        UNKNOWN_9A5F_CHAR in const.py), so it can go backwards. Any consumer
-        building on this re-learns the phase after a clean or a backwards step
-        rather than trusting it indefinitely.
+        So a cycle's timing is predictable from RUNTIME, and an assertion
+        outside the expected window could only be a deep clean -- a
+        discriminator needing no setpoint, temperature or effort. Note the
+        phase must be taken mod 3602: against 3600 it drifts ~48s per day.
+        A 3602 period is indistinguishable from 3600 plus two ticks of
+        per-cycle overhead, and the predictions are identical either way.
+
+        Each cycle burns exactly 240 lamp seconds (16 of 16 complete cycles),
+        and UV_RUNTIME does not move at all between cycles.
+
+        Still open: whether a deep clean disturbs the schedule. It runs the
+        lamp for ~45 minutes and may restart the timer, so a consumer re-learns
+        the phase after any clean. RUNTIME can also step backwards (below).
 
         Answering it needs RUNTIME recorded beside the clean bit across many
         cycles and both units, which this collects from ordinary use. Holding
         the connection to measure it directly costs the integration its device
         and does not scale past a single session.
 
-        Read only when DEBUG is enabled, so nobody else pays two extra GATT
+        LIFETIME is logged alongside as the cross-check on RUNTIME. RUNTIME is
+        known to step BACKWARDS: by 6,353 and 9,182 across an abrupt power loss
+        (see UNKNOWN_9A5F_CHAR), and once by exactly 131,072 -- two whole units
+        of byte 2 -- on a unit that was powered and connected throughout, with
+        the low 16 bits still counting normally through the step and the UV
+        schedule undisturbed either side of it. Whatever clocks the cycle is
+        therefore not this counter. If LIFETIME steps at the same moment the
+        fault is a shared storage or readout path; if it does not, LIFETIME is
+        a reference the step can be measured against.
+
+        Read only when DEBUG is enabled, so nobody else pays three extra GATT
         reads per poll for diagnostics they are not collecting. Failures are
         swallowed: a diagnostic must never be able to fail a poll.
         """
@@ -641,9 +656,13 @@ class OolerBLEDevice:
         try:
             runtime = await client.read_gatt_char(RUNTIME_CHAR)
             uv_runtime = await client.read_gatt_char(UV_RUNTIME_CHAR)
+            lifetime = await client.read_gatt_char(LIFETIME_CHAR)
         except Exception:  # noqa: BLE001 - never break a poll for a log line
-            return " runtime=? uv_runtime=?"
-        return f" runtime={_hex(runtime)} uv_runtime={_hex(uv_runtime)}"
+            return " runtime=? uv_runtime=? lifetime=?"
+        return (
+            f" runtime={_hex(runtime)} uv_runtime={_hex(uv_runtime)}"
+            f" lifetime={_hex(lifetime)}"
+        )
 
     def _derive_clean_states(
         self, asserted: bool, power: bool, settemp_f: int
