@@ -503,7 +503,7 @@ class OolerBLEDevice:
                         # Keyed on the VALUE, not on the clean flag alone. The
                         # device asserts CLEAN for its own hourly UV cycle
                         # without touching the setpoint, and suppressing
-                        # capture through those 3-5 minutes every hour would
+                        # capture through those 240 seconds every hour would
                         # silently lose a temperature the user did ask for.
                         self._last_user_setpoint = set_temperature
             elif uuid == ACTUALTEMP_CHAR:

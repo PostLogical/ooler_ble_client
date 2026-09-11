@@ -163,8 +163,8 @@ UNKNOWN_2AAA_CHAR = "00002aaa-0000-1000-8000-00805f9b34fb"  # read/write/notify;
 #   UV CLEAN -- the unit's own water treatment. The manual: "The control unit
 #   features an integrated water treatment system, which includes a UV light",
 #   listed as automatic and contrasted with the Deep Clean a person enables in
-#   the app. It runs roughly every hour of RUNTIME for 3-5 minutes, does NOT
-#   touch SET_TEMP, and cannot be started or stopped by anyone.
+#   the app. It runs every 3602 ticks of RUNTIME for exactly 240 lamp seconds,
+#   does NOT touch SET_TEMP, and cannot be started or stopped by anyone.
 #
 # So the bit alone proves nothing. THE DISCRIMINATOR IS SET_TEMP: only a deep
 # clean forces it to CLEAN_TEMP_F. Measured over 12 nights on two units
@@ -172,7 +172,10 @@ UNKNOWN_2AAA_CHAR = "00002aaa-0000-1000-8000-00805f9b34fb"  # read/write/notify;
 #
 #   - 38 clean-asserting reads captured with raw bytes; the byte is 0x01 every
 #     time, and SET_TEMP is never 0x4b (75) in any of them.
-#   - Period exactly 60.0 minutes, ~100 consecutive gaps, zero exceptions.
+#   - Period 3602 RUNTIME ticks (17 cycles, two units, dated from UV_RUNTIME at
+#     60s polling). The earlier "~60.0 minutes, ~100 consecutive gaps" was the
+#     wall-clock estimate from recorder history and is superseded: against a
+#     3600 model the phase drifts ~48s per day.
 #   - Only while powered: 437 polls on a powered-off unit produced nothing.
 #   - Not caused by anything we do. Polling 5x faster (5min -> 60s) left the
 #     period at exactly 60 minutes, and phase survived 7 of 7 reconnects.

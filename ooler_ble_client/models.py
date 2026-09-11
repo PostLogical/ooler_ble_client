@@ -38,9 +38,11 @@ class OolerBLEState:
     #: arms the setpoint override. See CLEAN_TEMP_F in const.py for how it is
     #: told apart from the UV cycle below, which shares its characteristic.
     deep_clean: bool | None = None
-    #: The device's own water-treatment cycle: roughly every hour of runtime,
-    #: 3-5 minutes, not startable or stoppable by anyone. See UV_CLEAN_MAX_
-    #: SECONDS in const.py.
+    #: The device's own water-treatment cycle: every 3602 ticks of runtime, for
+    #: exactly 240 lamp seconds, not startable or stoppable by anyone. False on
+    #: a powered-off unit even when the characteristic is asserted -- a cycle
+    #: interrupted by a power-off leaves the bit set with the device state
+    #: frozen. See CLEAN_TEMP_F in const.py.
     uv_clean: bool | None = None
     temperature_unit: TemperatureUnit | None = None
 
