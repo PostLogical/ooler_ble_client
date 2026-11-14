@@ -4,8 +4,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
-from collections.abc import Iterator
+from collections.abc import Coroutine, Iterator
 from contextlib import AbstractContextManager, contextmanager, suppress
+from typing import Any
 from unittest.mock import MagicMock, AsyncMock, patch
 
 import pytest
@@ -188,22 +189,11 @@ class TestCallbacks:
         received: list[OolerBLEState] = []
         device.register_callback(lambda s: received.append(s))
 
-        new_state = OolerBLEState(power=True, mode="Regular")
-        device._set_state_and_fire_callbacks(new_state)
+        device._state.power = True
+        device._fire_callbacks()
 
         assert len(received) == 1
         assert received[0].power is True
-
-    def test_no_fire_on_same_state(self) -> None:
-        device = OolerBLEDevice(model="OOLER-TEST")
-        received: list[OolerBLEState] = []
-        device.register_callback(lambda s: received.append(s))
-
-        state = OolerBLEState(power=True)
-        device._set_state_and_fire_callbacks(state)
-        device._set_state_and_fire_callbacks(state)
-
-        assert len(received) == 1
 
     def test_unregister(self) -> None:
         device = OolerBLEDevice(model="OOLER-TEST")
@@ -211,7 +201,7 @@ class TestCallbacks:
         unregister = device.register_callback(lambda s: received.append(s))
         unregister()
 
-        device._set_state_and_fire_callbacks(OolerBLEState(power=True))
+        device._fire_callbacks()
         assert len(received) == 0
 
     def test_multiple_callbacks(self) -> None:
@@ -221,7 +211,7 @@ class TestCallbacks:
         device.register_callback(lambda s: r1.append(s))
         device.register_callback(lambda s: r2.append(s))
 
-        device._set_state_and_fire_callbacks(OolerBLEState(power=True))
+        device._fire_callbacks()
         assert len(r1) == 1
         assert len(r2) == 1
 
@@ -714,7 +704,8 @@ class TestReadAllCharacteristics:
     async def test_reads_all_six_chars(self) -> None:
         device, client = _make_connected_device()
         client.read_gatt_char = AsyncMock(side_effect=_GATT_READS_F)
-        state = await device._read_all_characteristics()
+        await device._read_and_apply_all()
+        state = device.state
         assert state.power is True
         assert state.mode == "Regular"
         assert state.set_temperature == 72
@@ -731,7 +722,8 @@ class TestReadAllCharacteristics:
         client.read_gatt_char = AsyncMock(side_effect=[
             b"\x01", b"\x00", b"\x48", b"\x17", b"\x64", b"\x01",
         ])
-        state = await device._read_all_characteristics()
+        await device._read_and_apply_all()
+        state = device.state
         assert state.set_temperature == 22
         assert state.temperature_unit == "C"
 
@@ -739,7 +731,7 @@ class TestReadAllCharacteristics:
     async def test_raises_when_not_connected(self) -> None:
         device = OolerBLEDevice(model="OOLER-TEST")
         with pytest.raises(BleakError, match="Not connected"):
-            await device._read_all_characteristics()
+            await device._read_and_apply_all()
 
     @pytest.mark.asyncio
     async def test_unknown_mode_falls_back(self) -> None:
@@ -747,7 +739,8 @@ class TestReadAllCharacteristics:
         client.read_gatt_char = AsyncMock(side_effect=[
             b"\x01", b"\x09", b"\x48", b"\x4a", b"\x32", b"\x00",
         ])
-        state = await device._read_all_characteristics()
+        await device._read_and_apply_all()
+        state = device.state
         assert state.mode == "Regular"
 
     @pytest.mark.asyncio
@@ -755,7 +748,8 @@ class TestReadAllCharacteristics:
         device, client = _make_connected_device()
         device._state.temperature_unit = None
         client.read_gatt_char = AsyncMock(side_effect=_GATT_READS_F)
-        state = await device._read_all_characteristics()
+        await device._read_and_apply_all()
+        state = device.state
         assert state.temperature_unit == "F"
 
 
@@ -771,7 +765,9 @@ class TestImplausibleReadings:
             b"\x01", b"\x01", b"\x48", b"\x4a", b"\x00", b"\x00",
         ])
 
-        state = await device._read_all_characteristics()
+        await device._read_and_apply_all()
+
+        state = device.state
 
         # 0 is not a level the device reports: 1 is its empty reading.
         assert state.water_level == 100
@@ -784,7 +780,9 @@ class TestImplausibleReadings:
             b"\x01", b"\x01", b"\x48", b"\x81", b"\x32", b"\x00",
         ])
 
-        state = await device._read_all_characteristics()
+        await device._read_and_apply_all()
+
+        state = device.state
 
         assert state.actual_temperature == 74
 
@@ -799,7 +797,9 @@ class TestImplausibleReadings:
             b"\x01", b"\x01", b"\x48", b"\x45", b"\x32", b"\x00",
         ])
 
-        state = await device._read_all_characteristics()
+        await device._read_and_apply_all()
+
+        state = device.state
 
         assert state.actual_temperature == 21
 
@@ -812,7 +812,9 @@ class TestImplausibleReadings:
             b"\x01", b"\x01", b"\x48", b"\x46", b"\x01", b"\x00",
         ])
 
-        state = await device._read_all_characteristics()
+        await device._read_and_apply_all()
+
+        state = device.state
 
         # 1 is the real low-water reading and must not be mistaken for one
         # of the placeholders.
@@ -826,7 +828,9 @@ class TestImplausibleReadings:
             b"\x01", b"\x01", b"\x48", b"\x4a", b"\x00", b"\x00",
         ])
 
-        state = await device._read_all_characteristics()
+        await device._read_and_apply_all()
+
+        state = device.state
 
         assert state.water_level is None
 
@@ -1731,7 +1735,7 @@ class TestCallbackLifecycle:
         received: list[OolerBLEState] = []
         unregister = device.register_callback(lambda s: received.append(s))
         unregister()
-        device._set_state_and_fire_callbacks(OolerBLEState(power=True))
+        device._fire_callbacks()
         assert len(received) == 0
 
     def test_double_unregister_raises(self) -> None:
@@ -1750,7 +1754,7 @@ class TestCallbackLifecycle:
         device.register_callback(lambda s: r2.append(s))
         unsub1()
 
-        device._set_state_and_fire_callbacks(OolerBLEState(power=True))
+        device._fire_callbacks()
         assert len(r1) == 0
         assert len(r2) == 1
 
@@ -1771,16 +1775,13 @@ class TestConcurrentPollAndNotification:
     """Scenario 7: async_poll() concurrent with notification on same characteristic."""
 
     @pytest.mark.asyncio
-    async def test_poll_and_notification_same_char(self) -> None:
-        """Notification arrives during poll — state should be consistent."""
+    async def test_notification_after_the_read_wins(self) -> None:
+        """A notification landing after its field was read is newer than that
+        read, and the poll must not write the older reading over it."""
         device, client = _make_connected_device()
-        device._state.actual_temperature = 70
-
-        call_count = 0
+        device._state.actual_temperature = 78
 
         async def sequential_reads(char: str) -> bytes:
-            nonlocal call_count
-            call_count += 1
             responses = {
                 POWER_CHAR: b"\x01",
                 MODE_CHAR: b"\x01",
@@ -1789,8 +1790,8 @@ class TestConcurrentPollAndNotification:
                 WATER_LEVEL_CHAR: b"\x32",
                 CLEAN_CHAR: b"\x00",
             }
-            if char == ACTUALTEMP_CHAR:
-                # Notification arrives mid-poll with different value
+            if char == WATER_LEVEL_CHAR:
+                # Actual temperature has already been read; the device moves on.
                 device._notification_handler(
                     _make_sender(ACTUALTEMP_CHAR), bytearray(b"\x50")  # 80
                 )
@@ -1800,12 +1801,7 @@ class TestConcurrentPollAndNotification:
 
         await device.async_poll()
 
-        # Poll completes and sets state from read values.
-        # The notification's value (80) was overwritten by poll's value (78)
-        # via _set_state_and_fire_callbacks. This is correct — poll is
-        # authoritative as a full state snapshot.
-        # Either value is acceptable; the key thing is no crash/tearing.
-        assert device.state.actual_temperature in (78, 80)
+        assert device.state.actual_temperature == 80
 
     @pytest.mark.asyncio
     async def test_rapid_notifications_during_poll(self) -> None:
@@ -2667,7 +2663,8 @@ class TestCleanStateSplit:
                 power=True, settemp_f=CLEAN_TEMP_F, asserted=True
             )
         )
-        state = await device._read_all_characteristics()
+        await device._read_and_apply_all()
+        state = device.state
         assert state.deep_clean is True
         assert state.uv_clean is False
         assert device._deep_clean_pending is False  # provenance played no part
@@ -2680,7 +2677,8 @@ class TestCleanStateSplit:
         client.read_gatt_char = AsyncMock(
             side_effect=_clean_reads(power=True, settemp_f=66, asserted=True)
         )
-        state = await device._read_all_characteristics()
+        await device._read_and_apply_all()
+        state = device.state
         assert state.uv_clean is True
         assert state.deep_clean is False
 
@@ -2696,14 +2694,16 @@ class TestCleanStateSplit:
         client.read_gatt_char = AsyncMock(
             side_effect=_clean_reads(power=True, settemp_f=66, asserted=True)
         )
-        first = await device._read_all_characteristics()
+        await device._read_and_apply_all()
+        first = device.state
         assert first.uv_clean is True
 
         now += UV_CLEAN_MAX_SECONDS
         client.read_gatt_char = AsyncMock(
             side_effect=_clean_reads(power=True, settemp_f=66, asserted=True)
         )
-        later = await device._read_all_characteristics()
+        await device._read_and_apply_all()
+        later = device.state
         assert later.deep_clean is True
         assert later.uv_clean is False
 
@@ -2719,14 +2719,16 @@ class TestCleanStateSplit:
             client.read_gatt_char = AsyncMock(
                 side_effect=_clean_reads(power=True, settemp_f=66, asserted=True)
             )
-            assert (await device._read_all_characteristics()).uv_clean is True
+            await device._read_and_apply_all()
+            assert device.state.uv_clean is True
             now += 300.0
             client.read_gatt_char = AsyncMock(
                 side_effect=_clean_reads(
                     power=True, settemp_f=66, asserted=False
                 )
             )
-            assert (await device._read_all_characteristics()).uv_clean is False
+            await device._read_and_apply_all()
+            assert device.state.uv_clean is False
             now += 3300.0
 
         assert device._clean_asserted_since is None
@@ -2744,7 +2746,8 @@ class TestCleanStateSplit:
         client.read_gatt_char = AsyncMock(
             side_effect=_clean_reads(power=False, settemp_f=66, asserted=True)
         )
-        state = await device._read_all_characteristics()
+        await device._read_and_apply_all()
+        state = device.state
 
         assert state.deep_clean is False
         assert state.uv_clean is False
@@ -2752,6 +2755,40 @@ class TestCleanStateSplit:
             ConnectionEventType.CLEAN_ASSERTED_WHILE_OFF
         ]
         assert events[0].detail == {"set_temperature": 66}
+
+    @pytest.mark.asyncio
+    async def test_asserted_while_off_warns_once_per_run(self, caplog) -> None:
+        """It can latch for hours: 681 warnings in one day on one device. The
+        event still fires every poll, since consumers count it for duration."""
+        device, client = _make_connected_device(power=False)
+        events: list[ConnectionEvent] = []
+        device.register_connection_event_callback(events.append)
+
+        def poll_once(asserted: bool) -> Coroutine[Any, Any, set[str]]:
+            client.read_gatt_char = AsyncMock(
+                side_effect=_clean_reads(
+                    power=False, settemp_f=66, asserted=asserted
+                )
+            )
+            return device._read_and_apply_all()
+
+        def warnings() -> int:
+            return sum(
+                "CLEAN asserted while the device is off" in r.getMessage()
+                for r in caplog.records
+                if r.levelno == logging.WARNING
+            )
+
+        with caplog.at_level(logging.INFO, logger="ooler_ble_client"):
+            for _ in range(3):
+                await poll_once(asserted=True)
+            assert warnings() == 1
+            assert len(events) == 3
+
+            # The bit clears, and a later run is new and warned about again.
+            await poll_once(asserted=False)
+            await poll_once(asserted=True)
+            assert warnings() == 2
 
     def test_a_uv_cycle_does_not_swallow_the_users_setpoint(self) -> None:
         """The bug this split fixes on the capture side: for 3-5 minutes every
@@ -2827,7 +2864,7 @@ class TestCounterDiagnostics:
         device, client = _make_connected_device()
         client.read_gatt_char = AsyncMock(side_effect=_GATT_READS_F)
         with caplog.at_level(logging.INFO, logger="ooler_ble_client"):
-            await device._read_all_characteristics()
+            await device._read_and_apply_all()
         assert client.read_gatt_char.call_count == len(_GATT_READS_F)
 
     @pytest.mark.asyncio
@@ -2842,7 +2879,7 @@ class TestCounterDiagnostics:
             ]
         )
         with caplog.at_level(logging.DEBUG, logger="ooler_ble_client"):
-            await device._read_all_characteristics()
+            await device._read_and_apply_all()
         raw = [r.getMessage() for r in caplog.records if "Raw reads" in r.getMessage()]
         assert raw, "expected a Raw reads line"
         assert "runtime=82c61500" in raw[0]
@@ -2860,7 +2897,8 @@ class TestCounterDiagnostics:
             side_effect=[*_GATT_READS_F, BleakError("boom")]
         )
         with caplog.at_level(logging.DEBUG, logger="ooler_ble_client"):
-            state = await device._read_all_characteristics()
+            await device._read_and_apply_all()
+            state = device.state
         assert state.power is True
         assert state.set_temperature == 72
         raw = [r.getMessage() for r in caplog.records if "Raw reads" in r.getMessage()]

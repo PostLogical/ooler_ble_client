@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import struct
 import time
 from collections.abc import Callable, Coroutine
 from datetime import datetime, timezone
-from typing import Any, ClassVar, TypeVar
+from typing import Any, TypeVar
 
 _T = TypeVar("_T")
 
@@ -163,6 +164,9 @@ class OolerBLEDevice:
         # run of assertions, for the UV_CLEAN_MAX_SECONDS backstop. None while
         # the bit reads clear.
         self._clean_asserted_since: float | None = None
+        # The current run of CLEAN-asserted-while-off has been warned about.
+        # It can latch for hours, and a warning on every poll says nothing new.
+        self._warned_clean_while_off: bool = False
         # A deep clean this client asked for, from the write until it stops.
         # Provenance is deliberately NOT part of what deep_clean means -- a
         # clean started in the vendor's app has to be recognised too, and that
@@ -221,11 +225,6 @@ class OolerBLEDevice:
         """Stop the client."""
         _LOGGER.debug("%s: Stop", self._model_id)
         await self._execute_disconnect()
-
-    def _set_state_and_fire_callbacks(self, state: OolerBLEState) -> None:
-        if self._state != state:
-            self._state = state
-            self._fire_callbacks()
 
     def _fire_callbacks(self) -> None:
         """Fire the callbacks."""
@@ -521,91 +520,156 @@ class OolerBLEDevice:
                 exc_info=True,
             )
 
-    async def _read_all_characteristics(self) -> OolerBLEState:
-        """Read all GATT characteristics and return a new state."""
+    async def _read_and_apply_all(self) -> set[str]:
+        """Read every polled characteristic, applying each to state as it lands.
+
+        Returns the notify-backed fields whose reading disagreed with cached
+        state, which is empty unless the consistency check is armed.
+
+        Each reading is compared and applied before the next read is awaited.
+        The notification handler runs at every await, so reading everything
+        first and applying it at the end compared readings up to a second old
+        against a cache that notifications had since moved on, reported a
+        missed notification that was never missed, and then wrote the older
+        value over the newer one. Field by field, a notification that lands
+        before a read is already in the cache that read is compared against,
+        and one that lands after it overwrites it -- both correct.
+
+        Not airtight: a notification arriving together with a read's response
+        can be handled before the read's caller resumes. That window is
+        milliseconds rather than the length of a poll, and costs at worst a
+        needless re-subscribe.
+
+        Callbacks fire if anything changed, even when a read fails partway:
+        what was applied before the failure is real, and should not wait for
+        the next callback to reach consumers.
+        """
         client = self._client
         if client is None:
             raise BleakError("Not connected")
 
-        power_byte = await client.read_gatt_char(POWER_CHAR)
-        mode_byte = await client.read_gatt_char(MODE_CHAR)
-        settemp_byte = await client.read_gatt_char(SETTEMP_CHAR)
-        actualtemp_byte = await client.read_gatt_char(ACTUALTEMP_CHAR)
-        waterlevel_byte = await client.read_gatt_char(WATER_LEVEL_CHAR)
-        clean_byte = await client.read_gatt_char(CLEAN_CHAR)
+        before = dataclasses.replace(self._state)
+        missed: set[str] = set()
+        try:
+            # Use cached temperature_unit (read once on connect)
+            temperature_unit = self._state.temperature_unit or "F"
+            self._state.temperature_unit = temperature_unit
 
-        # The parsed state alone cannot distinguish a placeholder the device
-        # sent from a response that carried no data, since both parse to 0.
-        # Only the raw responses show which happened, so log them.
-        _LOGGER.debug(
-            "%s: Raw reads: power=%s mode=%s settemp=%s actualtemp=%s"
-            " water=%s clean=%s%s",
-            self._model_id,
-            _hex(power_byte),
-            _hex(mode_byte),
-            _hex(settemp_byte),
-            _hex(actualtemp_byte),
-            _hex(waterlevel_byte),
-            _hex(clean_byte),
-            await self._counter_diagnostics(client),
-        )
+            power_byte = await client.read_gatt_char(POWER_CHAR)
+            power = bool(int.from_bytes(power_byte, "little"))
+            if self._polled_disagrees(self._state.power, power):
+                missed.add("power")
+            self._state.power = power
+            # A poll is device truth as much as a notification is, so it keeps
+            # the transition baseline current. Without this the first power-off
+            # after every connection would go unwatched, since connect()
+            # establishes power by polling rather than by notification.
+            self._last_notified_power = power
 
-        power = bool(int.from_bytes(power_byte, "little"))
-        mode_int = int.from_bytes(mode_byte, "little")
-        if 0 <= mode_int < len(MODE_INT_TO_MODE_STATE):
-            mode = MODE_INT_TO_MODE_STATE[mode_int]
-        else:
-            _LOGGER.warning(
-                "%s: Unknown mode value during poll: %s", self._model_id, mode_int
+            mode_byte = await client.read_gatt_char(MODE_CHAR)
+            mode_int = int.from_bytes(mode_byte, "little")
+            if 0 <= mode_int < len(MODE_INT_TO_MODE_STATE):
+                mode = MODE_INT_TO_MODE_STATE[mode_int]
+                if self._polled_disagrees(self._state.mode, mode):
+                    missed.add("mode")
+                self._state.mode = mode
+            else:
+                _LOGGER.warning(
+                    "%s: Unknown mode value during poll: %s",
+                    self._model_id, mode_int,
+                )
+                if self._state.mode is None:
+                    self._state.mode = "Regular"
+
+            # SETTEMP_CHAR is always in Fahrenheit regardless of display unit.
+            settemp_byte = await client.read_gatt_char(SETTEMP_CHAR)
+            settemp_f = int.from_bytes(settemp_byte, "little")
+            set_temperature = (
+                _f_to_c(settemp_f) if temperature_unit == "C" else settemp_f
             )
-            mode = self._state.mode or "Regular"
-        # SETTEMP_CHAR is always in Fahrenheit regardless of display unit.
-        # ACTUALTEMP_CHAR is in whatever the display unit is set to.
-        settemp_f = int.from_bytes(settemp_byte, "little")
-        actualtemp_int = int.from_bytes(actualtemp_byte, "little")
-        waterlevel_int = int.from_bytes(waterlevel_byte, "little")
-        clean_asserted = bool(int.from_bytes(clean_byte, "little"))
-        deep_clean, uv_clean = self._derive_clean_states(
-            clean_asserted, power, settemp_f
-        )
+            if self._polled_disagrees(self._state.set_temperature, set_temperature):
+                missed.add("set_temperature")
+            self._state.set_temperature = set_temperature
 
-        # Use cached temperature_unit (read once on connect)
-        temperature_unit = self._state.temperature_unit or "F"
-
-        # The two sensor-derived characteristics sometimes answer a read
-        # taken just after a connect with a placeholder instead of a value.
-        # Keeping the last one is not a compromise: water level changes over
-        # days, and a temperature is replaced by its notification within a
-        # second, so the cached value is the right one either way.
-        actual_low, actual_high = (
-            ACTUAL_TEMP_RANGE_C if temperature_unit == "C" else ACTUAL_TEMP_RANGE_F
-        )
-        actual_temperature: int | None = actualtemp_int
-        if not actual_low <= actualtemp_int <= actual_high:
-            _LOGGER.warning(
-                "%s: Ignoring actual temperature %s, outside %s-%s%s",
-                self._model_id, actualtemp_int, actual_low, actual_high,
-                temperature_unit,
+            # ACTUALTEMP_CHAR is in whatever the display unit is set to.
+            #
+            # The two sensor-derived characteristics sometimes answer a read
+            # taken just after a connect with a placeholder instead of a value.
+            # Keeping the last one is not a compromise: water level changes
+            # over days, and a temperature is replaced by its notification
+            # within a second, so the cached value is the right one either way.
+            actualtemp_byte = await client.read_gatt_char(ACTUALTEMP_CHAR)
+            actualtemp_int = int.from_bytes(actualtemp_byte, "little")
+            actual_low, actual_high = (
+                ACTUAL_TEMP_RANGE_C if temperature_unit == "C"
+                else ACTUAL_TEMP_RANGE_F
             )
-            actual_temperature = self._state.actual_temperature
-        water_level: int | None = waterlevel_int
-        if not WATER_LEVEL_RANGE[0] <= waterlevel_int <= WATER_LEVEL_RANGE[1]:
-            _LOGGER.warning(
-                "%s: Ignoring water level %s, outside %s-%s",
-                self._model_id, waterlevel_int, *WATER_LEVEL_RANGE,
-            )
-            water_level = self._state.water_level
-        set_temperature = _f_to_c(settemp_f) if temperature_unit == "C" else settemp_f
+            if actual_low <= actualtemp_int <= actual_high:
+                if self._polled_disagrees(
+                    self._state.actual_temperature, actualtemp_int
+                ):
+                    missed.add("actual_temperature")
+                self._state.actual_temperature = actualtemp_int
+            else:
+                _LOGGER.warning(
+                    "%s: Ignoring actual temperature %s, outside %s-%s%s",
+                    self._model_id, actualtemp_int, actual_low, actual_high,
+                    temperature_unit,
+                )
 
-        return OolerBLEState(
-            power=power,
-            mode=mode,
-            set_temperature=set_temperature,
-            actual_temperature=actual_temperature,
-            water_level=water_level,
-            deep_clean=deep_clean,
-            uv_clean=uv_clean,
-            temperature_unit=temperature_unit,
+            waterlevel_byte = await client.read_gatt_char(WATER_LEVEL_CHAR)
+            waterlevel_int = int.from_bytes(waterlevel_byte, "little")
+            if WATER_LEVEL_RANGE[0] <= waterlevel_int <= WATER_LEVEL_RANGE[1]:
+                self._state.water_level = waterlevel_int
+            else:
+                _LOGGER.warning(
+                    "%s: Ignoring water level %s, outside %s-%s",
+                    self._model_id, waterlevel_int, *WATER_LEVEL_RANGE,
+                )
+
+            clean_byte = await client.read_gatt_char(CLEAN_CHAR)
+            clean_asserted = bool(int.from_bytes(clean_byte, "little"))
+            # Power from state rather than from this poll's own read: a
+            # power-off notified since that read has already cleared both
+            # flags, and the older read would bring a finished clean back.
+            self._state.deep_clean, self._state.uv_clean = (
+                self._derive_clean_states(
+                    clean_asserted, self._state.power is True, settemp_f
+                )
+            )
+
+            # The parsed state alone cannot distinguish a placeholder the
+            # device sent from a response that carried no data, since both
+            # parse to 0. Only the raw responses show which happened, so log
+            # them.
+            _LOGGER.debug(
+                "%s: Raw reads: power=%s mode=%s settemp=%s actualtemp=%s"
+                " water=%s clean=%s%s",
+                self._model_id,
+                _hex(power_byte),
+                _hex(mode_byte),
+                _hex(settemp_byte),
+                _hex(actualtemp_byte),
+                _hex(waterlevel_byte),
+                _hex(clean_byte),
+                await self._counter_diagnostics(client),
+            )
+        finally:
+            if self._state != before:
+                self._fire_callbacks()
+        return missed
+
+    def _polled_disagrees(self, cached: object, polled: object) -> bool:
+        """Whether a polled reading is evidence of a missed notification.
+
+        Only once the check is armed: the first poll of a connection is the
+        baseline, not a comparison. A ``None`` cache has nothing to compare
+        against either (e.g. before any connect).
+        """
+        return (
+            self._consistency_check_armed
+            and cached is not None
+            and cached != polled
         )
 
     async def _counter_diagnostics(self, client: BleakClientWithServiceCache) -> str:
@@ -678,6 +742,7 @@ class OolerBLEDevice:
         """
         if not asserted:
             self._clean_asserted_since = None
+            self._warned_clean_while_off = False
             return False, False
 
         now = self._monotonic()
@@ -689,7 +754,13 @@ class OolerBLEDevice:
             # Seen once, latched for ~9 hours, cause unknown. Reported rather
             # than modelled: claiming a cycle is running here would be a
             # statement we know to be false.
-            _LOGGER.warning(
+            #
+            # Warned once per run, since it can latch for hours. The event
+            # still fires every poll: consumers count it to see how long the
+            # run lasted.
+            log = _LOGGER.debug if self._warned_clean_while_off else _LOGGER.warning
+            self._warned_clean_while_off = True
+            log(
                 "%s: CLEAN asserted while the device is off; reporting neither "
                 "a deep clean nor a UV clean.",
                 self._model_id,
@@ -699,6 +770,7 @@ class OolerBLEDevice:
                 {"set_temperature": settemp_f},
             )
             return False, False
+        self._warned_clean_while_off = False
 
         deep_clean = (
             # The device forced the setpoint, which only a deep clean does.
@@ -715,10 +787,10 @@ class OolerBLEDevice:
     async def async_poll(self) -> None:
         """Retrieve state from device.
 
-        After a successful GATT read, compares the fresh values against
-        cached state on the four notify-backed fields. A disagreement
-        is positive evidence that a notification was missed, so the
-        recovery ladder in :meth:`_handle_subscription_mismatch` is
+        Each reading is compared against cached state on the four
+        notify-backed fields as it lands (see :meth:`_read_and_apply_all`).
+        A disagreement is positive evidence that a notification was missed,
+        so the recovery ladder in :meth:`_handle_subscription_mismatch` is
         invoked — Tier 1 re-subscribes in place, Tier 2 forces a full
         reconnect if a prior re-subscribe did not clear the mismatch.
         """
@@ -726,7 +798,7 @@ class OolerBLEDevice:
             return await self.connect()
 
         try:
-            state = await self._read_all_characteristics()
+            missed_fields = await self._read_and_apply_all()
         except BLEAK_RETRY_EXCEPTIONS:
             if self._connect_lock.locked():
                 raise  # Called from _ensure_connected, let its handler deal with it
@@ -735,71 +807,38 @@ class OolerBLEDevice:
             )
             await self._execute_forced_reconnect(trigger="poll_failure")
             try:
-                state = await self._read_all_characteristics()
+                missed_fields = await self._read_and_apply_all()
             except BLEAK_RETRY_EXCEPTIONS as err:
                 raise OolerConnectionError(
                     f"{self._model_id}: Poll failed after reconnect: {err}"
                 ) from err
 
         if self._consistency_check_armed:
-            missed_fields = self._check_notify_consistency(state)
             if missed_fields:
                 refreshed = await self._handle_subscription_mismatch(missed_fields)
                 if refreshed:
                     # Tier 2 ran: _execute_forced_reconnect → _ensure_connected
-                    # → an inner async_poll already applied fresh state.
-                    # Our pre-reconnect `state` value is now stale.
+                    # → an inner async_poll already re-read state and re-armed.
                     return
             else:
                 # Clean poll — any pending Tier 1 proved itself out.
                 self._tier1_pending = False
 
-        # A poll is device truth as much as a notification is, so it keeps the
-        # transition baseline current. Without this the first power-off after
-        # every connection would go unwatched, since connect() establishes
-        # power by polling rather than by notification.
-        self._last_notified_power = state.power
-        self._set_state_and_fire_callbacks(state)
         self._consistency_check_armed = True
         _LOGGER.debug("%s: State retrieved.", self._model_id)
-
-    _NOTIFY_BACKED_FIELDS: ClassVar[tuple[str, ...]] = (
-        "power",
-        "mode",
-        "set_temperature",
-        "actual_temperature",
-    )
-
-    def _check_notify_consistency(self, fresh: OolerBLEState) -> set[str]:
-        """Return field names where fresh poll values disagree with cached state.
-
-        Fields that are ``None`` in the cache are skipped — there is no
-        meaningful baseline to compare against (e.g., first poll after
-        instantiation before any connect).
-        """
-        missed: set[str] = set()
-        cached = self._state
-        for field in self._NOTIFY_BACKED_FIELDS:
-            cached_val = getattr(cached, field)
-            if cached_val is None:
-                continue
-            if cached_val != getattr(fresh, field):
-                missed.add(field)
-        return missed
 
     async def _handle_subscription_mismatch(
         self, missed_fields: set[str]
     ) -> bool:
         """Recover from a poll/state mismatch indicating missed notifications.
 
-        Returns ``True`` if the recovery path refreshed cached state
-        itself (Tier 2 — a forced reconnect whose inner poll already
-        applied fresh values). In that case the caller should NOT apply
-        its own pre-reconnect poll result.
+        Returns ``True`` if the recovery path re-read state itself (Tier 2 —
+        a forced reconnect whose inner poll re-read everything and re-armed
+        the check). In that case the caller has nothing left to do.
 
-        Tier 1 (re-subscribe in place) returns ``False`` — the caller
-        still applies the fresh poll values it just read, which become
-        the new cached baseline for the next poll's consistency check.
+        Tier 1 (re-subscribe in place) returns ``False``. The poll has
+        already applied the values it read, which become the baseline for
+        the next poll's consistency check.
         """
         sorted_fields = sorted(missed_fields)
         self._fire_connection_event(

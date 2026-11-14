@@ -78,7 +78,7 @@ def _poll_reads(
     water_level: int = 50,
     clean: bool = False,
 ) -> list[bytes]:
-    """The 6 GATT-read bytes for one ``_read_all_characteristics`` call,
+    """The 6 GATT-read bytes for one ``_read_and_apply_all`` call,
     in the order the client reads them."""
     return [
         int(power).to_bytes(1, "little"),

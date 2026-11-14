@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.1.0b15
+
+### Fixed
+- **A poll no longer writes an older reading over a newer notification or
+  write.** The poll read all six characteristics and only then compared and
+  applied them, while the notification handler ran at every read. A
+  notification landing mid-poll was reported as a missed notification, the
+  poll then overwrote it with its older reading, and the next poll "confirmed"
+  the mismatch and forced a reconnect. Over 22 days on two units this caused
+  all but one of 215 Tier-1 re-subscribes and most of 77 forced reconnects.
+  After a write it also showed the wrong state in consumers for a whole poll
+  interval: a unit turned on read as off, and a setpoint of 74 read as 72.
+  Each characteristic is now compared and applied as soon as it is read, so
+  whichever of a read and a notification is newer wins.
+- **A power-off during a poll no longer brings back a finished clean.** The
+  clean flags are derived from current power, not from the poll's own earlier
+  power reading.
+- **"CLEAN asserted while the device is off" warns once per occurrence**, then
+  logs at DEBUG while it lasts: it can latch for hours, and one device logged
+  681 warnings in a day. `CLEAN_ASSERTED_WHILE_OFF` still fires on every poll.
+
+### Changed
+- Poll callbacks fire when the poll changed anything, including a poll that
+  failed partway, since the values applied before the failure are real.
+
 ## 1.1.0b14
 
 ### Added

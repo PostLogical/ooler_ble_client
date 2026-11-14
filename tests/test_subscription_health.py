@@ -24,9 +24,11 @@ from ooler_ble_client import (
 )
 from ooler_ble_client.const import (
     ACTUALTEMP_CHAR,
+    CLEAN_CHAR,
     MODE_CHAR,
     POWER_CHAR,
     SETTEMP_CHAR,
+    WATER_LEVEL_CHAR,
     _SHUTDOWN_ERROR_MAX_ATTEMPTS,
 )
 
@@ -103,7 +105,7 @@ def _poll_reads(
     water_level: int = 50,
     clean: bool = False,
 ) -> list[bytes]:
-    """Build the 6 GATT-read bytes for one _read_all_characteristics call."""
+    """Build the 6 GATT-read bytes for one _read_and_apply_all call."""
     return [
         int(power).to_bytes(1, "little"),
         mode.to_bytes(1, "little"),
@@ -131,78 +133,221 @@ class FakeClock:
 
 
 # ---------------------------------------------------------------------------
-# _check_notify_consistency() pure comparison
+# Per-field comparison inside _read_and_apply_all()
 # ---------------------------------------------------------------------------
 
 
-class TestCheckNotifyConsistency:
-    def test_all_fields_match_returns_empty(self) -> None:
-        device, _ = _make_connected_powered_device()
-        # Fresh state identical to cached
-        from ooler_ble_client.models import OolerBLEState
+def _sender(uuid: str) -> MagicMock:
+    sender = MagicMock()
+    sender.uuid = uuid
+    return sender
 
-        fresh = OolerBLEState(
-            power=True,
-            mode="Regular",
-            set_temperature=72,
-            actual_temperature=74,
-            water_level=50,
-            deep_clean=False,
-            uv_clean=False,
-            temperature_unit="F",
-        )
-        assert device._check_notify_consistency(fresh) == set()
 
-    def test_actualtemp_mismatch_returned(self) -> None:
-        from ooler_ble_client.models import OolerBLEState
+class TestPolledComparison:
+    @pytest.mark.asyncio
+    async def test_all_fields_match_returns_empty(self) -> None:
+        device, client = _make_connected_powered_device()
+        client.read_gatt_char.side_effect = _poll_reads()
+        assert await device._read_and_apply_all() == set()
 
-        device, _ = _make_connected_powered_device()
-        fresh = OolerBLEState(
-            power=True,
-            mode="Regular",
-            set_temperature=72,
-            actual_temperature=76,  # differs from cached 74
-            water_level=50,
-            deep_clean=False,
-            uv_clean=False,
-            temperature_unit="F",
-        )
-        assert device._check_notify_consistency(fresh) == {"actual_temperature"}
+    @pytest.mark.asyncio
+    async def test_actualtemp_mismatch_returned(self) -> None:
+        device, client = _make_connected_powered_device()
+        client.read_gatt_char.side_effect = _poll_reads(actualtemp=76)
+        assert await device._read_and_apply_all() == {"actual_temperature"}
 
-    def test_multiple_mismatches_returned(self) -> None:
-        from ooler_ble_client.models import OolerBLEState
+    @pytest.mark.asyncio
+    async def test_multiple_mismatches_returned(self) -> None:
+        device, client = _make_connected_powered_device()
+        client.read_gatt_char.side_effect = _poll_reads(power=False, mode=2)
+        assert await device._read_and_apply_all() == {"power", "mode"}
 
-        device, _ = _make_connected_powered_device()
-        fresh = OolerBLEState(
-            power=False,  # differs
-            mode="Boost",  # differs
-            set_temperature=72,
-            actual_temperature=74,
-            water_level=50,
-            deep_clean=False,
-            uv_clean=False,
-            temperature_unit="F",
-        )
-        assert device._check_notify_consistency(fresh) == {"power", "mode"}
-
-    def test_none_cached_fields_are_skipped(self) -> None:
+    @pytest.mark.asyncio
+    async def test_none_cached_fields_are_skipped(self) -> None:
         """Fields with None in the cache (e.g. first poll after instantiation
         before any connect) have no baseline and must not be flagged."""
-        from ooler_ble_client.models import OolerBLEState
+        device, client = _make_connected_powered_device()
+        device._state.actual_temperature = None
+        client.read_gatt_char.side_effect = _poll_reads(actualtemp=76)
+        assert await device._read_and_apply_all() == set()
 
-        device = OolerBLEDevice(model="OOLER-WD")
-        # device._state starts as all None (except defaults from dataclass)
-        fresh = OolerBLEState(
-            power=True,
-            mode="Regular",
-            set_temperature=72,
-            actual_temperature=74,
-            water_level=50,
-            deep_clean=False,
-            uv_clean=False,
-            temperature_unit="F",
+
+# ---------------------------------------------------------------------------
+# Notifications and writes landing while a poll's reads are in flight
+# ---------------------------------------------------------------------------
+
+
+def _reads_with(
+    reads: list[bytes], at: str, action: Any
+) -> Any:
+    """A read side effect that serves ``reads`` in order and runs ``action``
+    just before answering the read of characteristic ``at``."""
+    order = [
+        POWER_CHAR, MODE_CHAR, SETTEMP_CHAR, ACTUALTEMP_CHAR,
+        WATER_LEVEL_CHAR, CLEAN_CHAR,
+    ]
+    by_char = dict(zip(order, reads))
+
+    async def read(char: str) -> bytes:
+        if char == at:
+            action()
+        return by_char[char]
+
+    return read
+
+
+class TestUpdatesDuringPoll:
+    """Field report, 1.1.0b14: 215 Tier-1s, every one following a notification
+    that landed while the poll's reads were in flight. The poll compared its
+    older reading against the newer cache, then wrote the older value over it,
+    so the next poll "confirmed" the mismatch and forced a reconnect."""
+
+    @pytest.mark.asyncio
+    async def test_notification_after_its_read_is_not_a_mismatch(self) -> None:
+        """Excerpt A: actual temperature read as 74, then notified as 73."""
+        device, client = _make_connected_powered_device()
+        client.read_gatt_char.side_effect = _reads_with(
+            _poll_reads(actualtemp=74),
+            at=WATER_LEVEL_CHAR,
+            action=lambda: device._notification_handler(
+                _sender(ACTUALTEMP_CHAR), bytearray(b"\x49")  # 73
+            ),
         )
-        assert device._check_notify_consistency(fresh) == set()
+        events: list[ConnectionEvent] = []
+        device.register_connection_event_callback(events.append)
+
+        await device.async_poll()
+
+        assert device.state.actual_temperature == 73
+        assert events == []
+        client.start_notify.assert_not_called()
+
+        # The next poll reads what the notification said: still nothing.
+        client.read_gatt_char.side_effect = _poll_reads(actualtemp=73)
+        await device.async_poll()
+        assert events == []
+
+    @pytest.mark.asyncio
+    async def test_notification_before_its_read_is_not_a_mismatch(self) -> None:
+        device, client = _make_connected_powered_device()
+        client.read_gatt_char.side_effect = _reads_with(
+            _poll_reads(actualtemp=76),
+            at=POWER_CHAR,
+            action=lambda: device._notification_handler(
+                _sender(ACTUALTEMP_CHAR), bytearray(b"\x4c")  # 76
+            ),
+        )
+        events: list[ConnectionEvent] = []
+        device.register_connection_event_callback(events.append)
+
+        await device.async_poll()
+
+        assert device.state.actual_temperature == 76
+        assert events == []
+
+    @pytest.mark.asyncio
+    async def test_power_on_during_poll_is_not_overwritten(self) -> None:
+        """Excerpt B: power read as off, then turned on before the poll
+        finished. HA showed the device off for a poll interval."""
+        device, client = _make_connected_powered_device(power=False)
+        device._last_notified_power = False
+
+        def turn_on() -> None:
+            device._notification_handler(_sender(POWER_CHAR), bytearray(b"\x01"))
+            device._state.power = True  # what set_power does once the write lands
+
+        client.read_gatt_char.side_effect = _reads_with(
+            _poll_reads(power=False), at=MODE_CHAR, action=turn_on
+        )
+        events: list[ConnectionEvent] = []
+        device.register_connection_event_callback(events.append)
+
+        await device.async_poll()
+
+        assert device.state.power is True
+        assert device._last_notified_power is True
+        assert events == []
+
+    @pytest.mark.asyncio
+    async def test_power_off_during_poll_does_not_revive_a_clean(self) -> None:
+        """A power-off ends a deep clean and clears the flag. A CLEAN read
+        after it must not bring the clean back on the strength of the poll's
+        own, older power reading."""
+        device, client = _make_connected_powered_device()
+        device._state.deep_clean = True
+        device._last_notified_power = True
+        client.read_gatt_char.side_effect = _reads_with(
+            _poll_reads(clean=True),
+            at=WATER_LEVEL_CHAR,
+            action=lambda: device._notification_handler(
+                _sender(POWER_CHAR), bytearray(b"\x00")
+            ),
+        )
+
+        await device.async_poll()
+
+        assert device.state.power is False
+        assert device.state.deep_clean is False
+        assert device.state.uv_clean is False
+
+    @pytest.mark.asyncio
+    async def test_real_mismatch_with_no_notification_still_escalates(self) -> None:
+        """The fix must not blind the detector: a value that changed with no
+        notification at all is still a missed notification."""
+        device, client = _make_connected_powered_device()
+        client.read_gatt_char.side_effect = (
+            _poll_reads(actualtemp=76) + _poll_reads(actualtemp=78)
+        )
+        reconnect_mock = AsyncMock()
+        device._execute_forced_reconnect = reconnect_mock  # type: ignore[method-assign]
+
+        await device.async_poll()
+        assert device._tier1_pending is True
+        await device.async_poll()
+        reconnect_mock.assert_awaited_once_with(trigger="subscription_mismatch")
+
+
+class TestPollCallbacks:
+    @pytest.mark.asyncio
+    async def test_poll_that_changes_nothing_fires_no_callback(self) -> None:
+        device, client = _make_connected_powered_device()
+        device._state.water_level = 50
+        device._state.deep_clean = False
+        device._state.uv_clean = False
+        client.read_gatt_char.side_effect = _poll_reads()
+        received: list[Any] = []
+        device.register_callback(received.append)
+
+        await device.async_poll()
+
+        assert received == []
+
+    @pytest.mark.asyncio
+    async def test_poll_that_changes_something_fires_once(self) -> None:
+        device, client = _make_connected_powered_device()
+        client.read_gatt_char.side_effect = _poll_reads(water_level=40)
+        received: list[Any] = []
+        device.register_callback(received.append)
+
+        await device.async_poll()
+
+        assert len(received) == 1
+        assert device.state.water_level == 40
+
+    @pytest.mark.asyncio
+    async def test_partial_poll_still_reports_what_it_applied(self) -> None:
+        """A read failing partway leaves real values already applied; they
+        must reach consumers now, not at the next callback."""
+        device, client = _make_connected_powered_device()
+        client.read_gatt_char.side_effect = [b"\x01", b"\x02", BleakError("lost")]
+        received: list[Any] = []
+        device.register_callback(received.append)
+
+        with pytest.raises(BleakError):
+            await device._read_and_apply_all()
+
+        assert device.state.mode == "Boost"
+        assert len(received) == 1
 
 
 # ---------------------------------------------------------------------------
