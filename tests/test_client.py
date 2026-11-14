@@ -744,6 +744,26 @@ class TestReadAllCharacteristics:
         assert state.mode == "Regular"
 
     @pytest.mark.asyncio
+    async def test_unknown_mode_keeps_a_cached_mode(self) -> None:
+        device, client = _make_connected_device()
+        device._state.mode = "Boost"
+        client.read_gatt_char = AsyncMock(side_effect=[
+            b"\x01", b"\x09", b"\x48", b"\x4a", b"\x32", b"\x00",
+        ])
+        await device._read_and_apply_all()
+        assert device.state.mode == "Boost"
+
+    @pytest.mark.asyncio
+    async def test_unknown_mode_with_nothing_cached_is_regular(self) -> None:
+        device, client = _make_connected_device()
+        device._state.mode = None
+        client.read_gatt_char = AsyncMock(side_effect=[
+            b"\x01", b"\x09", b"\x48", b"\x4a", b"\x32", b"\x00",
+        ])
+        await device._read_and_apply_all()
+        assert device.state.mode == "Regular"
+
+    @pytest.mark.asyncio
     async def test_defaults_temp_unit_to_f(self) -> None:
         device, client = _make_connected_device()
         device._state.temperature_unit = None
@@ -2757,7 +2777,9 @@ class TestCleanStateSplit:
         assert events[0].detail == {"set_temperature": 66}
 
     @pytest.mark.asyncio
-    async def test_asserted_while_off_warns_once_per_run(self, caplog) -> None:
+    async def test_asserted_while_off_warns_once_per_run(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
         """It can latch for hours: 681 warnings in one day on one device. The
         event still fires every poll, since consumers count it for duration."""
         device, client = _make_connected_device(power=False)
@@ -2858,7 +2880,9 @@ class TestCounterDiagnostics:
     not scale past one session."""
 
     @pytest.mark.asyncio
-    async def test_not_read_when_debug_is_off(self, caplog) -> None:
+    async def test_not_read_when_debug_is_off(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
         """Nobody should pay two extra GATT reads per poll for diagnostics
         they are not collecting."""
         device, client = _make_connected_device()
@@ -2868,7 +2892,9 @@ class TestCounterDiagnostics:
         assert client.read_gatt_char.call_count == len(_GATT_READS_F)
 
     @pytest.mark.asyncio
-    async def test_read_and_logged_when_debug_is_on(self, caplog) -> None:
+    async def test_read_and_logged_when_debug_is_on(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
         device, client = _make_connected_device()
         client.read_gatt_char = AsyncMock(
             side_effect=[
@@ -2888,7 +2914,7 @@ class TestCounterDiagnostics:
 
     @pytest.mark.asyncio
     async def test_a_failed_counter_read_does_not_fail_the_poll(
-        self, caplog
+        self, caplog: pytest.LogCaptureFixture
     ) -> None:
         """A diagnostic must never cost a poll. Raising here would trigger the
         reconnect path and discard state we had already read successfully."""
